@@ -1,0 +1,22 @@
+{
+  "name": "cherryrecorder-server",
+  "version": "0.1.0",
+  "description": "Server component for the CherryRecorder application",
+  "homepage": "https://github.com/your-username/CherryRecorder-Server",
+  "dependencies": [
+    "boost-asio",
+    "boost-beast",
+    "boost-json",
+    "openssl",
+    "spdlog"
+  ],
+  "features": {
+    "tests": {
+      "description": "Build with test dependencies",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  },
+  "builtin-baseline": "b02e341c927f16d991edbd915d8ea43eac52096c"
+}
