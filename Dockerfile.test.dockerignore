@@ -1,0 +1,90 @@
+# ========================================================
+# Docker Ignore File for C++ CMake Project (Optimized)
+# Target Environment: Windows 11 + Visual Studio + CMake
+# ========================================================
+
+# --- Git Files ---
+# Exclude the entire Git directory and related files
+.git/
+.gitignore
+.gitattributes
+
+# --- Build Artifacts ---
+# Exclude CMake generated build directories (adjust if using different names)
+build/
+out/
+
+# Exclude common Visual Studio/MSBuild output directories (case-insensitive)
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+ARM64/
+# Add other platform/configuration specific folders if necessary (e.g., Win32/)
+
+# --- IDE / Editor Specific Files ---
+# Visual Studio Code specific
+.vscode/
+
+# Visual Studio specific (case-insensitive)
+.vs/              # Visual Studio solution cache/settings directory
+*.user            # User-specific project settings
+*.suo             # Solution user options (older VS versions)
+*.vcxproj.user    # User-specific C++ project settings
+*.sln.dotsettings # ReSharper settings (if used)
+
+# --- Dependency Management (vcpkg) ---
+# Exclude local vcpkg artifacts. These should be generated inside the container.
+# IMPORTANT: Ensure the vcpkg directory itself (if checked into repo) and
+# vcpkg.json are NOT ignored if needed by the Dockerfile COPY command.
+vcpkg/buildtrees/
+vcpkg/downloads/
+vcpkg/packages/
+# vcpkg/installed/ # Also exclude pre-installed packages if any
+
+# --- Temporary & Log Files ---
+# Common temporary file extensions and log files
+*.log
+*.tmp
+*.bak
+*.swp             # Vim swap files
+
+# --- Local Configuration & Secrets ---
+# Files containing local environment settings or secrets
+*.local
+.env
+.env.*
+config.local.*
+secrets.*
+# Add any other specific secret file names/patterns
+
+# --- Documentation ---
+# Exclude documentation if not needed in the final image
+docs/
+*.md              # Optional: Exclude Markdown files
+LICENSE           # Optional: Exclude License file
+LICENSE.*
+
+# --- OS Specific Files ---
+# Windows thumbnail cache
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Other Common Exclusions ---
+*.zip
+*.tar.gz
+*.rar
+
+# ========================================================
+# Notes:
+# - Ensure essential files (CMakeLists.txt, vcpkg.json, src/, include/, tests/, etc.)
+#   are NOT excluded for test builds.
+# - This file uses Git's .gitignore syntax.
+# ======================================================== 

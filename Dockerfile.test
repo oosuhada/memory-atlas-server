@@ -1,0 +1,79 @@
+# ======================================================================
+# Dockerfile for Testing CherryRecorder Server (Beast only)
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# 스테이지 1: "builder" - 테스트를 포함한 빌드 환경
+# ----------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+LABEL stage="builder"
+ENV DEBIAN_FRONTEND=noninteractive
+
+# --- 빌드 도구 및 의존성 설치 ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git curl wget zip unzip tar pkg-config ca-certificates \
+    ninja-build libssl-dev gperf libunwind-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- 최신 CMake 설치 ---
+ARG CMAKE_VERSION=3.30.1
+RUN wget https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh \
+    -q -O /tmp/cmake-install.sh && chmod +x /tmp/cmake-install.sh && \
+    /tmp/cmake-install.sh --skip-license --prefix=/usr/local && rm /tmp/cmake-install.sh
+ENV PATH=/usr/local/bin:$PATH
+
+# --- vcpkg 설치 ---
+ARG VCPKG_COMMIT_HASH=b02e341c927f16d991edbd915d8ea43eac52096c
+WORKDIR /opt
+RUN git clone https://github.com/microsoft/vcpkg.git && cd vcpkg && \
+    git checkout ${VCPKG_COMMIT_HASH} && cd .. && ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+# --- 소스 코드 복사 ---
+WORKDIR /app
+COPY vcpkg.json CMakeLists.txt ./
+COPY src ./src/
+COPY include ./include/
+COPY tests ./tests/
+
+# --- 테스트 빌드 (CMake Configure) ---
+# BUILD_TESTING=ON 으로 설정
+RUN cmake -S . -B build \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+      -DVCPKG_TARGET_TRIPLET=x64-linux \
+      -DBUILD_TESTING=ON \
+      -DCMAKE_VERBOSE_MAKEFILE=ON
+
+# --- 테스트 빌드 (CMake Build) ---
+# 'CherryRecorder-Server-Testing' 타겟을 명시적으로 빌드
+RUN cmake --build build --target CherryRecorder-Server-Testing -j $(nproc)
+
+# ----------------------------------------------------------------------
+# 스테이지 2: "tester" - 테스트 실행 환경
+# ----------------------------------------------------------------------
+FROM ubuntu:24.04 AS tester
+
+LABEL stage="tester"
+ENV DEBIAN_FRONTEND=noninteractive
+
+# --- 런타임 의존성 설치 ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl libssl3 cmake \
+    libunwind8 libgoogle-glog0v6 libgflags2.2 libzstd1 libsodium23 libdouble-conversion3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- vcpkg 라이브러리 복사 ---
+COPY --from=builder /app/build/vcpkg_installed/x64-linux/lib/*.so* /usr/local/lib/
+RUN ldconfig
+
+# --- 빌드된 테스트 파일 복사 ---
+WORKDIR /app/build
+COPY --from=builder /app/build/CherryRecorder-Server-Testing ./
+
+# --- 테스트 실행 ---
+# GTest 필터를 사용하여 직접 실행파일을 실행하는 것이 더 명확할 수 있음
+# ctest를 사용하여 모든 테스트 실행
+# 여기서는 ctest를 계속 사용한다고 가정.
+CMD ["ctest", "--test-dir", ".", "--output-on-failure", "-C", "Debug"] 
