@@ -1,0 +1,241 @@
+# .github/workflows/reusable-docker-push-ecr.yml
+name: Reusable - Push Docker Image to ECR (Conditional)
+
+on:
+  workflow_call:
+    inputs:
+      image_name_ecr: # 예: 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/my-repo
+        required: true
+        type: string
+        description: 'ECR 리포지토리 전체 URI (태그 제외)'
+      image_tag_sha: # 예: sha-abcdef1
+        required: true
+        type: string
+        description: 'Git 커밋 SHA 기반 이미지 태그 (예: sha-7자sha)'
+      image_tag_latest: # 예: latest
+        required: true
+        type: string
+        default: 'latest'
+        description: ':latest 태그 문자열'
+      aws_region:
+        required: true
+        type: string
+        description: 'AWS 리전'
+      image_digest_built: # 예: sha256:aabbcc...
+        required: true
+        type: string
+        description: '이전 빌드 단계에서 생성된 이미지 매니페스트 다이제스트 (sha256:...)'
+      ghcr_image_uri_sha: # 예: ghcr.io/owner/repo:sha-abcdef1
+        required: true
+        type: string
+        description: 'Pull할 GHCR 이미지의 전체 URI (SHA 태그 포함)'
+      # 선택적 입력 파라미터
+      ecr_auto_create_repo:
+        required: false
+        type: boolean
+        default: true
+        description: 'ECR 리포지토리가 없을 경우 자동으로 생성할지 여부'
+      enable_image_scanning:
+        required: false
+        type: boolean
+        default: true
+        description: '자동 생성 시 ECR 리포지토리의 이미지 스캔(scanOnPush) 활성화 여부'
+    secrets:
+      aws_role_to_assume:
+        required: true
+        description: 'AWS OIDC 인증을 위한 IAM 역할 ARN'
+    outputs:
+      pushed:
+        description: "이미지가 ECR에 푸시되었으면 'true', 아니면 'false'"
+        value: ${{ jobs.push_ecr_job.outputs.pushed_output }}
+      ecr_image_uri: # 푸시된 SHA 태그 이미지 URI
+        description: "ECR에 성공적으로 푸시된 이미지의 전체 URI (SHA 태그 포함)"
+        value: ${{ jobs.push_ecr_job.outputs.ecr_image_uri }}
+
+jobs:
+  push_ecr_job:
+    name: Pull GHCR, Check Digest, Push to ECR
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write # AWS OIDC 인증
+      packages: read  # GHCR 이미지 Pull 권한
+    outputs:
+      # 스텝의 출력을 job 출력으로 매핑
+      pushed_output: ${{ steps.check-push.outputs.push_required }}
+      # push-image 스텝에서 설정된 이미지 URI 출력 (실제 푸시 발생 시에만 유효)
+      ecr_image_uri: ${{ steps.push-image.outputs.image_uri }}
+
+    steps:
+      # 1. AWS 자격 증명 설정 (OIDC)
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: GitHubActions-ECR-Push-${{ github.run_id }}
+
+      # 2. ECR 리포지토리 자동 생성 (조건부)
+      # 입력값 ecr_auto_create_repo가 true일 경우에만 실행
+      - name: Create ECR repository if it doesn't exist
+        if: inputs.ecr_auto_create_repo == true
+        run: |
+          # 입력받은 전체 ECR URI에서 리포지토리 이름만 추출
+          REPO_NAME=$(echo "${{ inputs.image_name_ecr }}" | cut -d'/' -f2)
+
+          # 리포지토리 존재 여부 확인 (오류 시 표준 에러는 /dev/null로 보내고, 명령어 실패 시 if문 조건 false)
+          if ! aws ecr describe-repositories --repository-names $REPO_NAME --region ${{ inputs.aws_region }} > /dev/null 2>&1; then
+            echo "ECR repository '$REPO_NAME' not found in region ${{ inputs.aws_region }}. Creating..."
+            # 리포지토리 생성 (이미지 스캔 옵션 포함)
+            aws ecr create-repository \
+              --repository-name $REPO_NAME \
+              --region ${{ inputs.aws_region }} \
+              --image-scanning-configuration scanOnPush=${{ inputs.enable_image_scanning }} \
+              --encryption-configuration encryptionType=AES256 # 기본 암호화 설정
+            echo "ECR repository '$REPO_NAME' created with scanOnPush=${{ inputs.enable_image_scanning }}."
+          else
+            echo "ECR repository '$REPO_NAME' already exists in region ${{ inputs.aws_region }}."
+          fi
+        shell: bash
+        # 이 단계에서 오류 발생 시(예: 권한 부족) 워크플로우를 중단하지 않고 계속 진행.
+        # 실제 푸시 단계에서 오류가 발생하여 실패 처리됨.
+        continue-on-error: true
+
+      # 3. Amazon ECR 로그인
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. GHCR 로그인 (이미지 Pull 위해)
+      # Private 리포지토리 Pull을 위해 필요. Public이면 생략 가능하나 명시적으로 두는 것이 안전.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }} # GITHUB_TOKEN 사용
+
+      # 5. skopeo와 jq 설치 (ECR 이미지 다이제스트 검사용)
+      - name: Install skopeo and jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo jq && sudo rm -rf /var/lib/apt/lists/*
+        shell: bash
+
+      # 6. 다이제스트 비교 (수정된 로직)
+      - name: Check image digests and set push flag
+        id: check-push
+        run: |
+          # ECR의 :latest 태그 이미지 매니페스트 다이제스트 확인
+          ECR_IMAGE_LATEST="${{ inputs.image_name_ecr }}:latest"
+          LATEST_DIGEST=""
+          echo "Checking manifest digest for ECR image: $ECR_IMAGE_LATEST"
+
+          # skopeo inspect 실행 (오류 시 빈 문자열 반환)
+          # 멀티 아키텍처 이미지의 경우 manifest list의 digest를 가져온다
+          LATEST_DIGEST=$(skopeo inspect --raw docker://$ECR_IMAGE_LATEST 2>/dev/null | jq -r '.digest // empty' || \
+                         skopeo inspect --format '{{.Digest}}' docker://$ECR_IMAGE_LATEST 2>/dev/null || echo "")
+
+          if [ -n "$LATEST_DIGEST" ]; then
+            echo "Current ECR :latest manifest digest: $LATEST_DIGEST"
+          else
+            echo "Could not retrieve digest for $ECR_IMAGE_LATEST (Image might not exist or registry error)."
+          fi
+
+          # 빌드된 이미지의 매니페스트 다이제스트 (input으로 받음)
+          BUILT_DIGEST="${{ inputs.image_digest_built }}"
+          echo "Built image manifest digest: $BUILT_DIGEST"
+
+          # 다이제스트 길이 로깅 (디버깅용)
+          echo "=== Digest Comparison ==="
+          echo "Built Digest  : [${BUILT_DIGEST}] (Length: ${#BUILT_DIGEST})"
+          echo "Latest Digest : [${LATEST_DIGEST}] (Length: ${#LATEST_DIGEST})"
+
+          if [ -n "$BUILT_DIGEST" ] && ([ "$BUILT_DIGEST" != "$LATEST_DIGEST" ] || [ -z "$LATEST_DIGEST" ]); then
+            echo "Result: Digests differ or latest is empty. Push required."
+            echo "push_required=true" >> $GITHUB_OUTPUT
+          else
+            echo "Result: Digests match or built digest is empty. Push not required."
+            echo "push_required=false" >> $GITHUB_OUTPUT
+          fi
+          echo "========================="
+
+        shell: bash
+
+      # 7. 이미지 Pull, Tag, Push (조건부 실행 및 재시도 로직)
+      - name: Pull from GHCR, Tag, and Push image to ECR
+        id: push-image
+        # check-push 스텝에서 push_required가 true일 때만 실행
+        if: steps.check-push.outputs.push_required == 'true'
+        env:
+          # 푸시에 사용할 변수 설정
+          ECR_IMAGE_BASE: ${{ inputs.image_name_ecr }}
+          TAG_SHA: ${{ inputs.image_tag_sha }}
+          TAG_LATEST: ${{ inputs.image_tag_latest }}
+          GHCR_IMAGE_SHA: ${{ inputs.ghcr_image_uri_sha }} # Pull 대상 GHCR 이미지
+        run: |
+          MAX_RETRIES=3 # 최대 재시도 횟수
+          RETRY_DELAY=5  # 재시도 간 기본 지연 시간(초)
+
+          # GHCR에서 이미지 Pull
+          echo "Pulling image from GHCR: $GHCR_IMAGE_SHA"
+          docker pull $GHCR_IMAGE_SHA
+          if [ $? -ne 0 ]; then echo "Error: Failed to pull image from GHCR"; exit 1; fi
+
+          # ECR용 태그 설정
+          echo "Tagging image for ECR:"
+          echo "  $GHCR_IMAGE_SHA -> $ECR_IMAGE_BASE:$TAG_SHA"
+          docker tag $GHCR_IMAGE_SHA $ECR_IMAGE_BASE:$TAG_SHA
+          echo "  $GHCR_IMAGE_SHA -> $ECR_IMAGE_BASE:$TAG_LATEST"
+          docker tag $GHCR_IMAGE_SHA $ECR_IMAGE_BASE:$TAG_LATEST
+
+          # 재시도 로직을 적용한 푸시 함수 정의
+          # 인자: 푸시할 전체 이미지 URI (예: my-repo:my-tag)
+          push_with_retry() {
+            local image_to_push="$1"
+            local attempt=1
+            while [ $attempt -le $MAX_RETRIES ]; do
+              echo "Push attempt $attempt/$MAX_RETRIES for $image_to_push"
+              # docker push 실행, 성공 시 0 반환
+              if docker push "$image_to_push"; then
+                echo "Push successful: $image_to_push"
+                return 0 # 성공
+              else
+                local exit_code=$?
+                echo "Push attempt $attempt failed with exit code $exit_code."
+                # 마지막 시도가 아니면 지연 시간 증가 후 재시도
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                  local sleep_time=$((RETRY_DELAY * attempt))
+                  echo "Retrying in ${sleep_time} seconds..."
+                  sleep $sleep_time
+                fi
+              fi
+              attempt=$((attempt + 1))
+            done
+            # 모든 재시도 실패
+            echo "Error: Failed to push $image_to_push after $MAX_RETRIES attempts."
+            return 1 # 실패
+          }
+
+          # 1. SHA 태그 푸시 (실패 시 워크플로우 중단)
+          echo "--- Pushing SHA tag to ECR ---"
+          if ! push_with_retry "$ECR_IMAGE_BASE:$TAG_SHA"; then
+            exit 1 # SHA 태그 푸시는 필수적이므로 실패 시 워크플로우 중단
+          fi
+
+          # 2. latest 태그 푸시 (실패 시 경고만 출력)
+          echo "--- Pushing latest tag to ECR ---"
+          if ! push_with_retry "$ECR_IMAGE_BASE:$TAG_LATEST"; then
+            # latest 태그 푸시 실패는 경고로 처리 (이미 SHA 태그는 성공적으로 푸시됨)
+            echo "Warning: Failed to push $ECR_IMAGE_BASE:$TAG_LATEST after $MAX_RETRIES attempts, but the SHA tag ($TAG_SHA) was pushed successfully."
+          fi
+
+          # 성공적으로 푸시된 이미지 URI (SHA 태그 기준)를 워크플로우 출력으로 설정
+          echo "image_uri=$ECR_IMAGE_BASE:$TAG_SHA" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # 8. 푸시 건너뛰기 메시지 (조건부 실행)
+      - name: Image push skipped
+        # check-push 스텝에서 push_required가 false일 때만 실행
+        if: steps.check-push.outputs.push_required == 'false'
+        run: |
+            echo "ECR push skipped: Image content digest matches the existing :latest tag or built digest is missing."
+        shell: bash

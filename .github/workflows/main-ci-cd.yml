@@ -1,0 +1,105 @@
+# .github/workflows/main-ci-cd.yml
+name: CI/CD - CherryRecorder Server
+
+# =====================================================================
+# 필수 GitHub Secrets 및 Variables 요약
+# =====================================================================
+# --- Secrets (민감 정보) ---
+# DOCKERHUB_USERNAME: Docker Hub 로그인 사용자 이름
+# DOCKERHUB_TOKEN: Docker Hub Access Token
+# GOOGLE_MAPS_API_KEY: Google Maps API 키
+#
+# --- Variables (설정값) ---
+# DOCKERHUB_REPO: Docker Hub 리포지토리 이름 (사용자명 제외)
+# SERVER_ADDRESS: 서버 주소 (예: cherryrecorder.example.com)
+# HTTP_PORT_VALUE: HTTP 포트 (기본: 8080)
+# WS_PORT_VALUE: WebSocket 포트 (기본: 33334)
+# =====================================================================
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # 수동 실행 가능
+
+jobs:
+  # --- 1. C++ 코드 빌드 및 테스트 ---
+  call_build_test:
+    name: 1. Build & Test (Linux)
+    uses: ./.github/workflows/reusable-build-test.yml
+    secrets:
+      GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+
+  # --- 2. 문서 생성 ---
+  call_docs_build:
+    name: 2. Generate Documentation
+    uses: ./.github/workflows/reusable-docs-build.yml
+    needs: call_build_test
+
+  # --- 3. GitHub Pages 배포 ---
+  deploy_docs_pages:
+    name: 3. Deploy Docs to GitHub Pages
+    runs-on: ubuntu-24.04
+    needs: call_docs_build
+    if: |
+        needs.call_docs_build.result == 'success' &&
+        needs.call_docs_build.outputs.docs-generated == 'true'
+    permissions: { pages: write, id-token: write }
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Docs to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # --- 4. Docker 이미지 빌드 및 GHCR 푸시 ---
+  call_docker_build:
+    name: 4. Build Docker Image & Push GHCR
+    uses: ./.github/workflows/reusable-docker-build.yml
+    needs: call_build_test
+    permissions:
+      packages: write
+      contents: read
+    with:
+      aws_region: 'us-east-1' # 기본값 (사용 안 함)
+      aws_account_id: '000000000000' # 기본값 (사용 안 함)
+      ecr_repo: 'dummy' # 기본값 (사용 안 함)
+      dockerhub_repo_base: ${{ vars.DOCKERHUB_REPO }}
+      ghcr_repo_name: ${{ github.event.repository.name }}
+
+  # --- 5. Docker Hub 푸시 ---
+  call_push_dh:
+    name: 5. Push Image to Docker Hub (If Changed)
+    if: needs.call_docker_build.result == 'success'
+    uses: ./.github/workflows/reusable-docker-push-dh.yml
+    needs: call_docker_build
+    with:
+      dockerhub_repo_name: ${{ vars.DOCKERHUB_REPO }}
+      image_tag_sha: ${{ needs.call_docker_build.outputs.image_tag_sha }}
+      image_tag_latest: 'latest'
+      ghcr_image_uri_sha: ${{ needs.call_docker_build.outputs.ghcr_image_uri_sha }}
+      image_digest_built: ${{ needs.call_docker_build.outputs.image_digest }}
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # --- 6. 연결 확인 (Watchtower 자동 배포 대기) ---
+  call_connection_check:
+    name: 6. Connection Check (Wait for Watchtower)
+    if: |
+      needs.call_push_dh.result == 'success' &&
+      needs.call_push_dh.outputs.pushed == 'true' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/reusable-connection-check.yml
+    needs: call_push_dh
+    with:
+      server_address: ${{ vars.SERVER_ADDRESS }}
+      health_check_port: ${{ vars.HTTP_PORT_VALUE }}
+      http_port: ${{ vars.HTTP_PORT_VALUE }}
+      websocket_port: ${{ vars.WS_PORT_VALUE }}
+      max_attempts: '60'              # 10분 / 10초 = 60회
+      retry_delay_seconds: '10'       # 10초 간격
+      connect_timeout_seconds: '5'    # 각 시도 타임아웃

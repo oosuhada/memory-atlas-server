@@ -1,0 +1,229 @@
+# .github/workflows/reusable-deploy-aws.yml
+# 목적: ECR에 푸시된 이미지를 사용하여 AWS ECS (EC2 유형) 서비스를 업데이트합니다.
+name: Reusable - Deploy to AWS ECS (EC2 Type)
+
+on:
+  workflow_call:
+    # 입력값 정의
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      image_name_ecr:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+        description: 배포할 고유 태그 (SHA)
+      container_name:
+        required: true
+        type: string
+      health_check_port_value: # 변수명 변경 (기존 server_port_value 대체)
+        required: true
+        type: string
+        default: "8080"
+        description: HTTP Health Check 서버가 사용할 컨테이너 포트
+      echo_server_port_value:  # TCP Echo 서버 포트 입력 추가
+        required: false
+        type: string
+        default: "33333"
+        description: (Deprecated) TCP Echo 서버가 사용할 컨테이너 포트
+      http_port_value:
+        required: false
+        type: string
+        default: "8080"
+        description: HTTP 서버가 사용할 컨테이너 포트
+      https_port_value:
+        required: false
+        type: string
+        default: "58080"
+        description: HTTPS 서버가 사용할 컨테이너 포트
+      websocket_port_value:
+        required: false
+        type: string
+        default: "33334"
+        description: WebSocket Chat 서버가 사용할 컨테이너 포트
+      task_definition_template_path:
+        required: true
+        type: string
+      ecs_cluster_name:
+        required: true
+        type: string
+      ecs_service_name:
+        required: true
+        type: string
+      ecs_task_def_family:
+        required: true
+        type: string
+        description: ECS 태스크 정의 패밀리 이름
+      subnet_ids:
+        required: false
+        type: string
+        description: Comma-separated list of subnet IDs for awsvpc network mode
+      security_group_ids:
+        required: false
+        type: string
+        description: Comma-separated list of security group IDs for awsvpc network mode
+    # 비밀값 정의
+    secrets:
+      aws_role_to_assume:
+        required: true
+      task_execution_role_arn:
+        required: true
+      # GOOGLE_MAPS_API_KEY secret 입력 추가
+      GOOGLE_MAPS_API_KEY:
+        required: false # 빌드 시에만 필수일 수 있으므로 false로 설정, 필요 시 true
+
+jobs:
+  deploy_job:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-24.04
+    # OIDC 인증 및 템플릿 파일 읽기 권한
+    permissions:
+      id-token: write # OIDC 인증 위해 필요
+      contents: read  # 템플릿 파일 읽기 위해 필요
+
+    steps:
+      # 1. 소스 코드 체크아웃 (템플릿 파일 접근 위해)
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      # 2. AWS 자격 증명 설정 (OIDC)
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: GitHubActions-Deploy-${{ github.run_id }}
+
+      # 3. 태스크 정의 템플릿 렌더링 (jq 사용)
+      - name: Render task definition template
+        id: render-task-definition
+        run: |
+          # 템플릿 렌더링을 위한 변수 준비
+          # GOOGLE_MAPS_API_KEY secret 값이 비어있을 경우 빈 문자열로 처리
+          GOOGLE_MAPS_API_KEY_VALUE="${{ secrets.GOOGLE_MAPS_API_KEY || '' }}"
+          
+          # 포트 값들이 비어있을 경우 기본값 설정
+          HTTP_PORT="${{ inputs.http_port_value }}"
+          WEBSOCKET_PORT="${{ inputs.websocket_port_value }}"
+          
+          # HTTP 포트 값이 비어있으면 기본값 사용
+          HTTP_PORT="${HTTP_PORT:-8080}"
+          # WebSocket 포트 값이 비어있으면 기본값 사용
+          WEBSOCKET_PORT="${WEBSOCKET_PORT:-33334}"
+
+          # 먼저 템플릿의 변수들을 sed로 치환하여 유효한 JSON 생성
+          # sed 구분자로 | 사용 (ARN 등에 포함된 / 문자와의 충돌 방지)
+          sed -e "s|\$FAMILY|${{ inputs.ecs_task_def_family }}|g" \
+              -e "s|\$EXECUTION_ROLE_ARN|${{ secrets.task_execution_role_arn }}|g" \
+              -e "s|\$CONTAINER_NAME|${{ inputs.container_name }}|g" \
+              -e "s|\${GOOGLE_MAPS_API_KEY}|${GOOGLE_MAPS_API_KEY_VALUE}|g" \
+              -e "s|\$AWS_REGION|${{ inputs.aws_region }}|g" \
+              ${{ inputs.task_definition_template_path }} > temp_task_def.json
+
+          # jq를 사용하여 추가 수정 (이미지 업데이트, 포트 매핑 덮어쓰기 등)
+          jq --arg image "${{ inputs.image_name_ecr }}:${{ inputs.image_tag }}" \
+             --arg http_port "${HTTP_PORT}" \
+             --arg websocket_port "${WEBSOCKET_PORT}" \
+             --arg google_maps_api_key "${GOOGLE_MAPS_API_KEY_VALUE}" \
+             '.
+              | .containerDefinitions[0].image = $image
+              | .containerDefinitions[0].portMappings = [
+                 { "containerPort": ($http_port | tonumber), "protocol": "tcp", "name": "http" },
+                 { "containerPort": ($websocket_port | tonumber), "protocol": "tcp", "name": "websocket" }
+               ]
+              | .containerDefinitions[0].environment = (.containerDefinitions[0].environment | map(
+                 if .name == "HTTP_PORT" then .value = $http_port
+                 elif .name == "WS_PORT" then .value = $websocket_port
+                 elif .name == "GOOGLE_MAPS_API_KEY" then .value = $google_maps_api_key
+                 else . end
+               ))
+              | .containerDefinitions[0].healthCheck.command = [
+                 "CMD-SHELL",
+                 "curl -f http://localhost:" + $http_port + "/health || exit 1"
+               ]
+             ' temp_task_def.json > rendered.json
+
+          # 임시 파일 삭제
+          rm temp_task_def.json
+
+          echo "Rendered Task Definition:"
+          cat rendered.json # 렌더링 결과 확인용 로그
+
+      # 4. 태스크 정의 등록
+      - name: Register task definition
+        id: register-task
+        run: |
+          echo "Registering task definition from rendered.json..."
+          TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://rendered.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered task definition ARN: $TASK_DEF_ARN"
+          # 다음 단계에서 사용할 수 있도록 ARN을 출력 변수로 설정
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      # 5. ECS 서비스 업데이트
+      - name: Update ECS service
+        run: |
+          echo "Checking if service ${{ inputs.ecs_service_name }} exists in cluster ${{ inputs.ecs_cluster_name }}..."
+          
+          # 서비스 존재 여부 확인
+          if aws ecs describe-services --cluster ${{ inputs.ecs_cluster_name }} --services ${{ inputs.ecs_service_name }} --query 'services[0].status' --output text 2>/dev/null | grep -q "ACTIVE"; then
+            echo "Service exists. Attempting to update..."
+            
+            # 서비스 업데이트 시도
+            if ! aws ecs update-service \
+              --cluster ${{ inputs.ecs_cluster_name }} \
+              --service ${{ inputs.ecs_service_name }} \
+              --task-definition ${{ steps.register-task.outputs.task_def_arn }} \
+              --force-new-deployment \
+              --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.subnet_ids }}],securityGroups=[${{ inputs.security_group_ids }}],assignPublicIp=DISABLED}" 2>&1 | tee update_result.txt; then
+              
+              # 에러가 포트 관련인지 확인
+              if grep -q "container port" update_result.txt; then
+                echo "Port configuration mismatch detected. Recreating service..."
+                
+                # 서비스 삭제
+                echo "Deleting existing service..."
+                aws ecs update-service \
+                  --cluster ${{ inputs.ecs_cluster_name }} \
+                  --service ${{ inputs.ecs_service_name }} \
+                  --desired-count 0
+                
+                aws ecs delete-service \
+                  --cluster ${{ inputs.ecs_cluster_name }} \
+                  --service ${{ inputs.ecs_service_name }}
+                
+                # 서비스가 완전히 삭제될 때까지 대기
+                echo "Waiting for service deletion..."
+                aws ecs wait services-inactive \
+                  --cluster ${{ inputs.ecs_cluster_name }} \
+                  --services ${{ inputs.ecs_service_name }} || true
+                
+                # 새 서비스 생성
+                echo "Creating new service with updated configuration..."
+                aws ecs create-service \
+                  --cluster ${{ inputs.ecs_cluster_name }} \
+                  --service-name ${{ inputs.ecs_service_name }} \
+                  --task-definition ${{ steps.register-task.outputs.task_def_arn }} \
+                  --desired-count 1 \
+                  --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100" \
+                  --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.subnet_ids }}],securityGroups=[${{ inputs.security_group_ids }}],assignPublicIp=DISABLED}"
+              else
+                # 다른 에러인 경우 실패
+                echo "Service update failed with non-port related error"
+                exit 1
+              fi
+            fi
+          else
+            echo "Service does not exist. Creating new service..."
+            aws ecs create-service \
+              --cluster ${{ inputs.ecs_cluster_name }} \
+              --service-name ${{ inputs.ecs_service_name }} \
+              --task-definition ${{ steps.register-task.outputs.task_def_arn }} \
+              --desired-count 1 \
+              --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100" \
+              --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.subnet_ids }}],securityGroups=[${{ inputs.security_group_ids }}],assignPublicIp=DISABLED}"
+          fi
+          
+          echo "Service update/creation completed."

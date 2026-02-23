@@ -1,0 +1,253 @@
+# .github/workflows/reusable-connection-check.yml
+name: Reusable - Connection Check (HTTP & TCP)
+
+on:
+  workflow_call:
+    inputs:
+      server_address:
+        description: '배포된 서버의 주소 (예: NLB DNS 이름, IP 주소)'
+        required: true
+        type: string
+      health_check_port:
+        description: 'HTTP Health Check 엔드포인트 포트 번호'
+        required: true
+        type: string
+        default: "8080"
+      http_port:
+        description: 'NLB HTTPS 리스너 포트 번호'
+        required: false
+        type: string
+        default: "58080"
+      websocket_port:
+        description: 'NLB WSS 리스너 포트 번호'
+        required: false
+        type: string
+        default: "33335"
+      max_attempts:
+        description: '각 포트에 대한 최대 연결 시도 횟수'
+        required: false
+        type: string
+        default: '12'
+      retry_delay_seconds:
+        description: '재시도 간 기본 지연 시간 (초) - 실제 지연은 시도 횟수에 따라 증가'
+        required: false
+        type: string
+        default: '15'
+      connect_timeout_seconds:
+        description: '각 연결 시도에 대한 타임아웃 시간 (초)'
+        required: false
+        type: string
+        default: '10'
+      expected_http_response:
+        description: 'HTTP Health Check 응답 본문에 포함되어야 하는 문자열 (선택 사항)'
+        required: false
+        type: string
+        default: ''
+      initial_wait_seconds:
+        description: '연결 확인 시작 전 초기 대기 시간 (초)'
+        required: false
+        type: string
+        default: '30'
+    outputs:
+      connection_status:
+        description: "모든 연결 확인 최종 결과 ('success' 또는 'fail')"
+        value: ${{ jobs.check_job.outputs.status }}
+
+jobs:
+  check_job:
+    name: Check Connection to Server Ports
+    runs-on: ubuntu-24.04
+    env:
+      HTTP_PORT: ${{ inputs.http_port }}
+      WEBSOCKET_PORT: ${{ inputs.websocket_port }}
+    outputs:
+      status: ${{ steps.set-status.outputs.final_status }}
+    steps:
+      - name: Install network tools
+        run: |
+          sudo apt-get update && \
+          sudo apt-get install -y --no-install-recommends netcat-openbsd curl dnsutils && \
+          sudo rm -rf /var/lib/apt/lists/*
+        shell: bash
+
+      # DNS 검증 단계 추가
+      - name: Verify DNS resolution
+        run: |
+          echo "Resolving hostname: ${{ inputs.server_address }}"
+          IP_ADDRESSES=$(dig +short ${{ inputs.server_address }})
+          
+          if [ -z "$IP_ADDRESSES" ]; then
+            echo "Warning: Could not resolve hostname ${{ inputs.server_address }}"
+            echo "This might be a DNS issue or the hostname might be incorrect."
+          else
+            echo "Hostname resolved to: $IP_ADDRESSES"
+          fi
+        shell: bash
+        continue-on-error: true
+
+      # 초기 대기 시간 추가
+      - name: Initial wait for service startup
+        run: |
+          INITIAL_WAIT=${{ inputs.initial_wait_seconds || 30 }}
+          echo "Waiting $INITIAL_WAIT seconds for service to start..."
+          echo "This gives time for:"
+          echo "  - Container to be deployed and started"
+          echo "  - Application to initialize"
+          echo "  - Health checks to begin"
+          sleep $INITIAL_WAIT
+        shell: bash
+
+      - name: Perform Connection Checks
+        id: connection-check
+        run: |
+          MAX_ATTEMPTS=${{ inputs.max_attempts || 12 }}
+          BASE_RETRY_DELAY=${{ inputs.retry_delay_seconds || 15 }}
+          CONNECT_TIMEOUT=${{ inputs.connect_timeout_seconds || 10 }}
+          
+          # 지수 백오프 함수
+          calculate_delay() {
+            local attempt=$1
+            # 지수 백오프: delay = base * (1.5 ^ (attempt - 1)), 최대 120초
+            local delay=$(awk "BEGIN {print int($BASE_RETRY_DELAY * (1.5 ^ ($attempt - 1)))}")
+            if [ $delay -gt 120 ]; then
+              delay=120
+            fi
+            echo $delay
+          }
+          
+          # --- 1. HTTP Health Endpoint 확인 ---
+          # nginx/ALB를 통한 HTTPS 연결
+          HEALTH_URL="https://${{ inputs.server_address }}/api/health"
+          echo "=== Checking HTTP endpoint: ${HEALTH_URL} ==="
+          
+          attempt=1
+          total_wait_time=0
+          while [ $attempt -le $MAX_ATTEMPTS ]; do
+            echo ""
+            echo "Health Check Attempt $attempt/$MAX_ATTEMPTS (Total wait time: ${total_wait_time}s)"
+            echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+            
+            # curl의 verbose 모드로 더 자세한 정보 출력
+            echo "Running: curl -sSv --fail --connect-timeout $CONNECT_TIMEOUT ${HEALTH_URL}"
+            if curl -sSv --fail --connect-timeout $CONNECT_TIMEOUT "${HEALTH_URL}" 2>&1; then
+              echo "✅ Health check successful on port ${{ inputs.health_check_port }}!"
+              break
+            else
+              curl_exit_code=$?
+              echo "❌ Health check failed with exit code: $curl_exit_code"
+              
+              # curl 오류 코드 해석
+              case $curl_exit_code in
+                7) echo "   → Connection refused (server might not be ready yet)" ;;
+                28) echo "   → Connection timeout (server might be overloaded)" ;;
+                22) echo "   → HTTP error response (check server logs)" ;;
+                60) echo "   → SSL certificate problem" ;;
+                *) echo "   → Unknown error (check curl documentation)" ;;
+              esac
+            fi
+            
+            if [ $attempt -eq $MAX_ATTEMPTS ]; then
+              echo ""
+              echo "❌ Error: HTTP Health check failed after $MAX_ATTEMPTS attempts."
+              echo "Total time waited: ${total_wait_time} seconds"
+              echo "Consider checking:"
+              echo "  - Container logs in deployment environment"
+              echo "  - Target group health in load balancer"
+              echo "  - Security group rules"
+              exit 1
+            fi
+            
+            # 지수 백오프 계산
+            RETRY_DELAY=$(calculate_delay $attempt)
+            total_wait_time=$((total_wait_time + RETRY_DELAY))
+            
+            echo "⏳ Health check failed, retrying in $RETRY_DELAY seconds..."
+            echo "   (Using exponential backoff strategy)"
+            sleep $RETRY_DELAY
+            attempt=$((attempt+1))
+          done
+
+          # --- 2. WS 연결 확인 ---
+          echo ""
+          # WebSocket은 nginx/ALB를 통해 프록시
+          WS_ENDPOINT="${{ inputs.server_address }}"
+          echo "=== Checking WS endpoint: wss://${WS_ENDPOINT}/ws ==="
+          
+          attempt=1
+          total_wait_time=0
+          while [ $attempt -le $MAX_ATTEMPTS ]; do
+            echo ""
+            echo "WS Check Attempt $attempt/$MAX_ATTEMPTS (Total wait time: ${total_wait_time}s)"
+            echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+            
+            # WebSocket 연결을 시도 (curl로 WebSocket upgrade 테스트)
+            # curl의 전체 출력을 변수에 저장
+            echo "Running WebSocket upgrade test..."
+            CURL_OUTPUT=$(curl -i --http1.1 --connect-timeout $CONNECT_TIMEOUT \
+              -H 'Upgrade: websocket' \
+              -H 'Connection: Upgrade' \
+              -H 'Sec-WebSocket-Version: 13' \
+              -H 'Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==' \
+              -H 'Origin: https://kugorang.github.io' \
+              https://${WS_ENDPOINT}/ws 2>&1)
+            
+            echo "Response:"
+            echo "$CURL_OUTPUT" | head -20
+            
+            # 101 Switching Protocols 응답 확인
+            if echo "$CURL_OUTPUT" | grep -qE "(101 Switching Protocols|HTTP/[0-9.]+ 101)"; then
+              echo "✅ WS handshake successful via nginx/ALB proxy!"
+              break
+            else
+              echo "❌ WS connection test failed"
+              # 추가 디버깅 정보
+              if echo "$CURL_OUTPUT" | grep -q "404"; then
+                echo "   → 404 Not Found: /ws endpoint might not exist"
+              elif echo "$CURL_OUTPUT" | grep -q "400"; then
+                echo "   → 400 Bad Request: WebSocket upgrade headers might be blocked"
+              elif echo "$CURL_OUTPUT" | grep -q "502"; then
+                echo "   → 502 Bad Gateway: Backend WebSocket server might be down"
+              fi
+            fi
+            
+            if [ $attempt -eq $MAX_ATTEMPTS ]; then
+              echo ""
+              echo "❌ Error: WS connection test failed after $MAX_ATTEMPTS attempts."
+              echo "Total time waited: ${total_wait_time} seconds"
+              exit 1
+            fi
+            
+            # 지수 백오프 계산
+            RETRY_DELAY=$(calculate_delay $attempt)
+            total_wait_time=$((total_wait_time + RETRY_DELAY))
+            
+            echo "⏳ WS connection test failed, retrying in $RETRY_DELAY seconds..."
+            sleep $RETRY_DELAY
+            attempt=$((attempt+1))
+          done
+          
+          echo ""
+          echo "🎉 All connection checks passed successfully!"
+          exit 0
+        shell: bash
+        # continue-on-error 제거하여 실패 시 step이 실패로 표시되도록 함
+
+      # 최종 상태 설정
+      - name: Set final connection status
+        id: set-status
+        if: always()
+        run: |
+          # connection-check step의 결과를 확인
+          CONNECTION_RESULT="${{ steps.connection-check.outcome }}"
+          
+          if [ "$CONNECTION_RESULT" = "success" ]; then
+            echo "✅ All connection checks passed successfully!"
+            echo "final_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Connection checks failed!"
+            echo "Connection check result: $CONNECTION_RESULT"
+            echo "final_status=fail" >> $GITHUB_OUTPUT
+            # 명시적으로 실패 반환
+            exit 1
+          fi
+        shell: bash

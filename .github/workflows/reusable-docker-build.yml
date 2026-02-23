@@ -1,0 +1,266 @@
+# .github/workflows/reusable-docker-build.yml
+# 목적: Dockerfile을 사용하여 이미지를 빌드/캐시하고, GHCR에 푸시하며, 이미지 정보를 출력합니다.
+name: Reusable - Build Docker Image, Push Cache/GHCR, Output Info
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: 'ECR 레지스트리가 위치한 AWS 리전'
+        required: true
+        type: string
+      aws_account_id:
+        description: 'ECR 레지스트리 접근을 위한 AWS 계정 ID'
+        required: true
+        type: string
+      ecr_repo:
+        description: 'ECR 리포지토리 이름'
+        required: true
+        type: string
+      dockerhub_repo_base:
+        description: 'Docker Hub 리포지토리 기본 이름 (사용자명 제외)'
+        required: true
+        type: string
+      ghcr_repo_name:
+        description: 'GHCR 리포지토리 이름 (기본값: GitHub 리포지토리 이름)'
+        required: false
+        type: string
+        default: ${{ github.event.repository.name }}
+
+    outputs:
+      image_digest:
+        description: 'GHCR에 푸시된 이미지의 최종 매니페스트 다이제스트 (예: sha256:...)'
+        value: ${{ jobs.build_image_job.outputs.image_digest }}
+      image_tag_sha:
+        description: '빌드에 사용된 Git 커밋 SHA 기반 태그 (예: sha-7자sha)'
+        value: ${{ jobs.build_image_job.outputs.image_tag_sha }}
+      image_name_ecr:
+        description: '생성된 ECR용 전체 이미지 URI (태그 제외)'
+        value: ${{ jobs.build_image_job.outputs.image_name_ecr }}
+      dh_repo_name_base_output:
+        description: '입력으로 받은 Docker Hub 리포지토리 기본 이름 (다른 워크플로우 전달용)'
+        value: ${{ jobs.build_image_job.outputs.dh_repo_name_base_output }}
+      ghcr_image_uri_sha:
+         description: 'GHCR에 푸시된 이미지의 전체 URI (SHA 태그 포함, 다른 워크플로우 전달용)'
+         value: ${{ jobs.build_image_job.outputs.ghcr_image_uri_sha }}
+
+jobs:
+  build_image_job:
+    name: Build, Cache, Push GHCR, Get Info
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write # GHCR 푸시/캐시 권한
+      contents: read
+    outputs:
+      image_name_ecr: ${{ steps.set-names.outputs.ecr_name }}
+      dh_repo_name_base_output: ${{ steps.set-names.outputs.dh_repo_base }}
+      image_tag_sha: ${{ steps.tag-image.outputs.tag }}
+      image_digest: ${{ steps.build_and_push_ghcr.outputs.digest }}
+      ghcr_image_uri_sha: ${{ steps.set-names.outputs.ghcr_image_sha }}
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Image Tag (SHA)
+        id: tag-image
+        run: echo "tag=sha-${{ github.sha }}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # 소스 코드로부터 빌드 ID 생성 (변경 시에만 달라지도록)
+      - name: Generate Build ID from source
+        id: build-id
+        run: |
+          # 빌드 캐시 및 변경 감지를 위한 고유 ID 생성
+          # .git, out, build 디렉토리를 제외한 모든 파일의 내용을 기반으로 SHA256 해시 계산
+          # 파일 목록 변경 또는 내용 변경 시 해시값이 달라짐
+          SOURCE_HASH=$(find . -type f -not -path "./.git/*" -not -path "./out/*" -not -path "./build/*" | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          echo "Generated source hash: $SOURCE_HASH"
+          echo "source_hash=${SOURCE_HASH}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set Image Names (ECR, GHCR) and Output Base DH Name
+        id: set-names
+        env:
+          AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          ECR_REPO: ${{ inputs.ecr_repo }}
+          DH_REPO_BASE_INPUT: ${{ inputs.dockerhub_repo_base }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          GHCR_REPO_INPUT: ${{ inputs.ghcr_repo_name }}
+          TAG_SHA: ${{ steps.tag-image.outputs.tag }}
+        run: |
+          # 1. ECR 이미지 이름 생성
+          # ECR 레지스트리 주소
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          # ECR 전체 이미지 이름 (태그 제외)
+          ECR_NAME="$ECR_REGISTRY/$ECR_REPO"
+
+          # 2. GHCR 이미지 이름 및 캐시 태그 생성
+          # 소유자 이름 소문자 변환
+          GHCR_OWNER_LC=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          # 리포 이름 소문자 변환
+          GHCR_REPO_LC=$(echo "$GHCR_REPO_INPUT" | tr '[:upper:]' '[:lower:]')
+          # GHCR 기본 경로
+          GHCR_BASE="ghcr.io/${GHCR_OWNER_LC}/${GHCR_REPO_LC}"
+          # GHCR 푸시용 이미지 URI (SHA 태그 포함)
+          GHCR_IMAGE_SHA="${GHCR_BASE}:${TAG_SHA}"
+          # GHCR을 Docker 빌드 캐시 저장소로 사용하기 위한 고정 태그
+          GHCR_CACHE_REF="${GHCR_BASE}:buildcache"
+
+          # 3. 출력 변수 설정
+          echo "ecr_name=$ECR_NAME" >> $GITHUB_OUTPUT
+          echo "ghcr_image_sha=$GHCR_IMAGE_SHA" >> $GITHUB_OUTPUT
+          echo "ghcr_cache_ref=$GHCR_CACHE_REF" >> $GITHUB_OUTPUT
+          # Docker Hub 기본 이름은 입력값을 그대로 전달하여 다음 단계(Docker Hub 푸시)에서 사용
+          echo "dh_repo_base=$DH_REPO_BASE_INPUT" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+        
+      - name: Set up Docker Buildx
+        id: buildx # ID는 그대로 유지하거나 변경해도 무방
+        uses: docker/setup-buildx-action@v3
+        with:
+          # 더 큰 빌드 캐시 사용
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+          buildkitd-flags: --debug
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      # vcpkg 바이너리 캐시 복원
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v3
+        with:
+          path: ${{ github.workspace }}/vcpkg-cache
+          key: vcpkg-binaries-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}-${{ hashFiles('**/vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-binaries-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}-
+            vcpkg-binaries-${{ runner.os }}-
+      
+      # vcpkg 캐시 디렉토리 생성 및 환경 변수 설정
+      - name: Setup vcpkg cache directory
+        run: |
+          mkdir -p ${{ github.workspace }}/vcpkg-cache
+          echo "VCPKG_BINARY_SOURCES=clear;files,${{ github.workspace }}/vcpkg-cache,readwrite" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }} # GITHUB_TOKEN 사용
+
+      # 현재 GHCR에 있는 이미지의 매니페스트 다이제스트 확인 (선택적이지만 비교 로직에 유용할 수 있음)
+      # 주의: 이 스텝은 푸시 전에만 의미가 있으므로, 필요 없다면 제거해도 됨.
+      #       단, 푸시 전에 변경 여부를 미리 알고 싶다면 유지할 수 있다.
+      #       하지만 build-push-action 자체가 이미 푸시된 동일 다이제스트는 건너뛰므로, 필수는 아님.
+      # - name: Check existing GHCR image manifest digest (Optional)
+      #   id: check-ghcr
+      #   continue-on-error: true # 이미지가 없거나 접근 불가 시 에러 무시
+      #   run: |
+      #     GHCR_IMAGE="${{ steps.set-names.outputs.ghcr_image_sha }}"
+      #     EXISTING_DIGEST=$(docker manifest inspect $GHCR_IMAGE --verbose 2>/dev/null | jq -r '.Descriptor.digest // ""' || echo "")
+      #     echo "existing_digest=$EXISTING_DIGEST" >> $GITHUB_OUTPUT
+      #     echo "Existing GHCR image manifest digest (before push): $EXISTING_DIGEST"
+      #   shell: bash
+
+      - name: Cache last build hash
+        uses: actions/cache@v3
+        id: cache-last-build
+        with:
+          path: .last_build_hash
+          key: buildhash-${{ steps.build-id.outputs.source_hash }}
+
+      - name: Check if source changed
+        id: check-changed
+        run: |
+          if [ -f .last_build_hash ]; then
+            PREV_HASH=$(cat .last_build_hash)
+            CUR_HASH="${{ steps.build-id.outputs.source_hash }}"
+            if [ "$PREV_HASH" = "$CUR_HASH" ]; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Get last commit time
+        id: last_commit_time
+        run: |
+          COMMIT_TIME=$(git log -1 --pretty=%ct)
+          echo "commit_time=$COMMIT_TIME" >> $GITHUB_OUTPUT
+          # or human-readable date
+          # COMMIT_DATE=$(git log -1 --pretty=%cd --date=iso)
+          # echo "commit_date=$COMMIT_DATE" >> $GITHUB_OUTPUT
+
+      - name: Get SOURCE_DATE_EPOCH
+        id: source_date
+        run: |
+          # git의 마지막 커밋 유닉스 타임을 SOURCE_DATE_EPOCH으로 쓸 수 있음
+          EPOCH_VAL=$(git log -1 --pretty=%ct)
+          echo "epoch=$EPOCH_VAL" >> $GITHUB_OUTPUT
+
+      # 빌드 및 GHCR 푸시 (개선된 캐싱 설정)
+      - name: Build and push to GHCR with Cache
+        if: steps.check-changed.outputs.changed == 'true'
+        id: build_and_push_ghcr # ID 변경
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64  # 멀티 아키텍처 지원 추가
+          # GHCR에 푸시할 태그 지정 (SHA 태그)
+          tags: ${{ steps.set-names.outputs.ghcr_image_sha }}
+          push: true # 항상 GHCR에는 푸시 (캐싱 및 후속 작업 기반)
+          # GHCR을 캐시 소스 및 대상으로 사용
+          cache-from: |
+            type=registry,ref=${{ steps.set-names.outputs.ghcr_cache_ref }}
+            type=gha
+          # 캐시 저장 설정 (mode=max로 변경하여 모든 레이어 저장)
+          cache-to: |
+            type=registry,ref=${{ steps.set-names.outputs.ghcr_cache_ref }},mode=max
+            type=gha,mode=max
+          provenance: false # SBOM/Provenance 비활성화 (필요 시 true)
+          sbom: false      # SBOM/Provenance 비활성화 (필요 시 true)
+          # BuildKit 인라인 캐시 활성화 및 빌드 인수 전달
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            BUILD_ID=${{ steps.build-id.outputs.source_hash }}
+            GIT_COMMIT=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.source_date.outputs.epoch }}
+            VCPKG_BINARY_SOURCES=clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+          # 빌드킷 설정
+          builder: ${{ steps.buildx.outputs.name }}
+          # 이미지 레이블 설정
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            build.id=${{ steps.build-id.outputs.source_hash }}
+            build.date=${{ steps.last_commit_time.outputs.commit_time }}
+
+      # build-push-action의 digest 출력 확인 (디버깅용)
+      - name: Debug image info
+        if: always() # 항상 실행하여 정보 확인
+        run: |
+          echo "Image pushed to GHCR: ${{ steps.set-names.outputs.ghcr_image_sha }}"
+          echo "Build-push action manifest digest: ${{ steps.build_and_push_ghcr.outputs.digest }}" # 수정된 스텝 ID와 출력 참조
+          # echo "Extracted content digest: ..." 라인 제거됨
+        shell: bash
+
+      - name: Final post-build step
+        run: |
+          if [ "${{ steps.check-changed.outputs.changed }}" = "true" ]; then
+            echo "${{ steps.build-id.outputs.source_hash }}" > .last_build_hash
+            echo "Hash saved for next build."
+          else
+            echo "No changes. Build skipped."
+          fi
+        shell: bash

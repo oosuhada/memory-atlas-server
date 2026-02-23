@@ -1,0 +1,91 @@
+# .github/workflows/reusable-docs-build.yml
+name: Reusable - Generate Documentation
+
+on:
+  workflow_call:
+    outputs:
+      docs-generated:
+        description: "문서가 새로 생성되었는지 여부"
+        value: ${{ jobs.docs_job.outputs.docs-generated }}
+
+jobs:
+  docs_job:
+    name: Generate and Upload Doxygen Docs
+    runs-on: ubuntu-24.04
+    outputs:
+      docs-generated: ${{ steps.set-docs-status.outputs.generated }}
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Install Doxygen & Graphviz
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends doxygen graphviz && sudo rm -rf /var/lib/apt/lists/*
+        shell: bash
+
+      # 캐시 키 개선: 더 많은 소스 파일 포함
+      - name: Cache Doxygen output
+        id: cache-docs
+        uses: actions/cache@v4
+        with:
+          path: ./docs/docs_output/html
+          key: ${{ runner.os }}-doxygen-${{ hashFiles('docs/Doxyfile') }}-${{ hashFiles('src/**', 'include/**', 'docs/**', 'README.md') }}
+          restore-keys: |
+            ${{ runner.os }}-doxygen-${{ hashFiles('docs/Doxyfile') }}-
+
+      # Doxyfile 설정 확인 단계 추가
+      - name: Verify Doxyfile settings
+        id: check-doxyfile
+        run: |
+          if [ ! -f "./docs/Doxyfile" ]; then
+            echo "Error: Doxyfile not found at ./docs/Doxyfile"
+            exit 1
+          fi
+          
+          OUTPUT_DIR=$(grep "OUTPUT_DIRECTORY" ./docs/Doxyfile | grep -v "#" | cut -d"=" -f2- | tr -d ' "')
+          HTML_DIR=$(grep "HTML_OUTPUT" ./docs/Doxyfile | grep -v "#" | cut -d"=" -f2- | tr -d ' "')
+          
+          echo "Doxyfile OUTPUT_DIRECTORY: $OUTPUT_DIR"
+          echo "Doxyfile HTML_OUTPUT: $HTML_DIR"
+          
+          EXPECTED_PATH="./docs/docs_output"
+          if [ "$OUTPUT_DIR" != "$EXPECTED_PATH" ] && [ "$OUTPUT_DIR" != "docs_output" ]; then
+            echo "Warning: OUTPUT_DIRECTORY in Doxyfile ($OUTPUT_DIR) doesn't match expected path ($EXPECTED_PATH)"
+            echo "Please update Doxyfile or workflow file to use consistent paths."
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: Generate Documentation
+        id: generate_docs
+        if: steps.cache-docs.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss. Generating documentation..."
+          doxygen ./docs/Doxyfile
+          # 문서 생성 확인
+          if [ -d "./docs/docs_output/html" ]; then
+            echo "Documentation generated successfully"
+          else
+            echo "Error: Documentation generation failed. Output directory not found."
+            exit 1
+          fi
+        shell: bash
+
+      # 문서 생성 상태 설정 (캐시 히트/미스 모두 처리)
+      - name: Set docs generation status
+        id: set-docs-status
+        run: |
+          if [ "${{ steps.cache-docs.outputs.cache-hit }}" == "true" ]; then
+            echo "Using cached documentation."
+            echo "generated=false" >> $GITHUB_OUTPUT
+          else
+            echo "New documentation was generated."
+            echo "generated=true" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs/docs_output/html

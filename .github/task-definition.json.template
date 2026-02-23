@@ -1,0 +1,124 @@
+{
+  "family": "$FAMILY",
+  "executionRoleArn": "$EXECUTION_ROLE_ARN",
+  "taskRoleArn": "$EXECUTION_ROLE_ARN",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [ "EC2" ],
+  "cpu": "300",
+  "memory": "300",
+  "pidMode": "host",
+  "ipcMode": "host",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "$CONTAINER_NAME",
+      "image": "placeholder",
+      "cpu": 300,
+      "memory": 300,
+      "memoryReservation": 256,
+      "essential": true,
+      "privileged": true,
+      "linuxParameters": {
+        "capabilities": {
+          "add": [
+            "SYS_PTRACE",
+            "NET_ADMIN",
+            "SYS_ADMIN"
+          ]
+        },
+        "initProcessEnabled": true,
+        "sharedMemorySize": 16,
+        "tmpfs": [
+          {
+            "containerPath": "/tmp",
+            "size": 32
+          },
+          {
+            "containerPath": "/dev/shm",
+            "size": 16
+          }
+        ]
+      },
+      "ulimits": [
+        {
+          "name": "nofile",
+          "softLimit": 2048,
+          "hardLimit": 2048
+        },
+        {
+          "name": "nproc",
+          "softLimit": 512,
+          "hardLimit": 512
+        }
+      ],
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp",
+          "name": "http",
+          "appProtocol": "http"
+        },
+        {
+          "containerPort": 33334,
+          "protocol": "tcp",
+          "name": "websocket",
+          "appProtocol": "http"
+        }
+      ],
+      "environment": [
+        {
+          "name": "HTTP_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "WS_PORT",
+          "value": "33334"
+        },
+        {
+          "name": "USE_SSL",
+          "value": "false"
+        },
+        {
+          "name": "BEHIND_PROXY",
+          "value": "true"
+        },
+        {
+          "name": "HTTP_THREADS",
+          "value": "2"
+        },
+        {
+          "name": "CHAT_THREADS",
+          "value": "2"
+        },
+        {
+          "name": "GOOGLE_MAPS_API_KEY",
+          "value": "${GOOGLE_MAPS_API_KEY}"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "ERROR"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/$FAMILY",
+          "awslogs-region": "$AWS_REGION",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

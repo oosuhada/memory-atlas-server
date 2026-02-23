@@ -1,0 +1,95 @@
+# .github/workflows/reusable-build-test.yml
+# 목적: Linux 환경에서 C++ 프로젝트를 빌드하고 CTest를 실행합니다.
+name: Reusable - C++ Build & Test (Linux)
+
+on:
+  workflow_call: # 재사용 가능하도록 설정
+    secrets: # 호출 워크플로우로부터 받을 시크릿 명시
+      GOOGLE_MAPS_API_KEY: # CTest 실행 시 필요한 API 키
+        required: true # 이 시크릿은 필수임
+
+jobs:
+  build_job:
+    name: Build and Test C++ Code
+    runs-on: ubuntu-24.04
+    steps:
+      # 1. 빌드 의존성 설치 (jq 포함)
+      - name: Install Build Dependencies (inc. jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git curl zip unzip tar pkg-config ninja-build jq libssl-dev libmysqlclient-dev ca-certificates
+          # 필요 없는 apt 캐시 정리
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # 2. 소스 코드 체크아웃
+      - name: Check out source code repository
+        uses: actions/checkout@v4
+        with:
+            submodules: true
+            fetch-depth: 0
+
+      # 3. vcpkg 캐싱 및 부트스트랩 관련 단계 (이전과 동일)
+      - name: Enable vcpkg GHA Cache Integration
+        uses: actions/github-script@v7
+        with:
+            script:
+                core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+                core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Configure vcpkg Binary Caching Env Var
+        run: echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $GITHUB_ENV
+      - name: Cache vcpkg Downloads & Buildtrees
+        uses: actions/cache@v4
+        with:
+            path: |
+                ${{ github.workspace }}/vcpkg/downloads
+                ${{ github.workspace }}/vcpkg/buildtrees
+            key: vcpkg-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}
+            restore-keys: | 
+                vcpkg-${{ runner.os }}-
+      - name: Update and Bootstrap vcpkg (Linux)
+        run: |
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      # 4. CMake 캐시
+      - name: Cache CMake Build Directory
+        uses: actions/cache@v4
+        with:
+            path: ${{ github.workspace }}/build
+            key: build-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt', '**/vcpkg.json') }}
+            restore-keys: |
+                build-${{ runner.os }}-
+
+      # 5. CMake Configure (Release, Tests Enabled)
+      - name: Configure CMake Project (Linux, Release)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DVCPKG_TARGET_TRIPLET=x64-linux
+          -DBUILD_TESTING=ON
+          -DVCPKG_MANIFEST_FEATURES=tests
+
+      # 6. CMake Build
+      - name: Build Project using CMake (Linux)
+        run: cmake --build build -j $(nproc)
+
+      # Debugging: Check if GOOGLE_MAPS_API_KEY is set
+      - name: Check if GOOGLE_MAPS_API_KEY is set
+        run: |
+          if [ -n "${{ secrets.GOOGLE_MAPS_API_KEY }}" ]; then
+            echo "GOOGLE_MAPS_API_KEY is set."
+          else
+            echo "GOOGLE_MAPS_API_KEY is NOT set or empty."
+            # If the key is absolutely required for tests, uncomment the next line to fail early
+            # exit 1
+          fi
+
+      # 7. CTest 실행
+      - name: Run tests via CTest (Linux)
+        env:
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+        run: |
+          cd build
+          ctest --output-on-failure
+          cd ..

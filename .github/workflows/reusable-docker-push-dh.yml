@@ -1,0 +1,187 @@
+# .github/workflows/reusable-docker-push-dh.yml
+# 목적: GHCR에서 이미지를 풀링하고, 다이제스트 비교 후 변경 시 Docker Hub로 푸시합니다.
+name: Reusable - Pull GHCR & Push Docker Image to Docker Hub (Conditional)
+
+on:
+  workflow_call:
+    inputs:
+      # Docker Hub 리포지토리 기본 이름 (예: cherryrecorder-server, 사용자명 제외)
+      dockerhub_repo_name:
+        description: 'Docker Hub 리포지토리 기본 이름 (사용자명 제외)'
+        required: true
+        type: string
+      image_tag_sha: # 예: sha-abcdef1
+        description: 'Git 커밋 SHA 기반 이미지 태그 (예: sha-7자sha)'
+        required: true
+        type: string
+      image_tag_latest: # 예: latest
+        description: ':latest 태그 문자열'
+        required: true
+        type: string
+        default: 'latest'
+      image_digest_built: # 예: sha256:aabbcc...
+        description: '이전 빌드 단계에서 생성된 이미지 매니페스트 다이제스트 (sha256:...)'
+        required: true
+        type: string
+      # Pull 대상 GHCR 이미지 URI (SHA 태그 포함)
+      ghcr_image_uri_sha: # 예: ghcr.io/owner/repo:sha-abcdef1
+        description: 'Pull할 GHCR 이미지의 전체 URI (SHA 태그 포함)'
+        required: true
+        type: string
+    secrets:
+      dockerhub_username:
+        description: 'Docker Hub 사용자 이름'
+        required: true
+      dockerhub_token:
+        description: 'Docker Hub 접근 토큰 (비밀번호 대신 권장)'
+        required: true
+    outputs: # 푸시 실행 여부 출력
+      pushed:
+        description: "이미지가 Docker Hub에 푸시되었으면 'true', 아니면 'false'"
+        value: ${{ jobs.push_dh_job.outputs.pushed_output }}
+
+jobs:
+  push_dh_job:
+    name: Pull GHCR, Check Digest, Push to Docker Hub
+    runs-on: ubuntu-24.04
+    outputs:
+      pushed_output: ${{ steps.check-push-dh.outputs.push_required }} # 스텝 출력을 job 출력으로 매핑
+
+    steps:
+      # 1. Docker Hub 로그인
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      # 2. GHCR 로그인 (이미지 Pull 위해)
+      # Private 리포지토리 Pull을 위해 필요. Public이면 생략 가능하나 명시적으로 두는 것이 안전.
+      - name: Log in to GitHub Container Registry (for pull)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }} # GITHUB_TOKEN 사용
+
+      # 3. Docker Buildx 설정 (multi-arch manifest 처리를 위해)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. skopeo와 jq 설치 (Docker Hub 이미지 다이제스트 검사용)
+      # skopeo: Docker Hub 등 외부 레지스트리의 이미지 정보를 Docker 클라이언트 없이 조회 가능
+      # jq: JSON 파싱을 위해 필요 (멀티 아키텍처 manifest 처리)
+      - name: Install skopeo and jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo jq && sudo rm -rf /var/lib/apt/lists/*
+        shell: bash
+
+      # 5. Docker Hub의 :latest 태그 매니페스트 다이제스트 조회 (수정된 로직)
+      - name: Get Docker Hub image manifest digest
+        id: get-latest-digest-dh
+        env:
+            DH_USER: ${{ secrets.dockerhub_username }}
+            DH_REPO: ${{ inputs.dockerhub_repo_name }} # 입력받은 리포 이름 사용
+        run: |
+            # Docker Hub API 및 도구 호환성을 위해 사용자명/리포명 소문자 변환
+            DH_USER_LC=$(echo "$DH_USER" | tr '[:upper:]' '[:lower:]')
+            DH_REPO_LC=$(echo "$DH_REPO" | tr '[:upper:]' '[:lower:]')
+            DH_IMAGE_LATEST="${DH_USER_LC}/${DH_REPO_LC}:latest"
+
+            echo "Checking manifest digest for Docker Hub image: $DH_IMAGE_LATEST"
+            LATEST_DIGEST="" # 초기화
+
+            # skopeo inspect로 :latest 이미지의 다이제스트 조회 시도
+            # 멀티 아키텍처 이미지의 경우 manifest list의 digest를 가져온다
+            LATEST_DIGEST=$(skopeo inspect --raw docker://$DH_IMAGE_LATEST 2>/dev/null | jq -r '.digest // empty' || \
+                           skopeo inspect --format '{{.Digest}}' docker://$DH_IMAGE_LATEST 2>/dev/null || echo "")
+
+            if [ -n "$LATEST_DIGEST" ]; then
+              echo "Current :latest manifest digest in Docker Hub: $LATEST_DIGEST"
+            else
+              echo "Could not retrieve digest for $DH_IMAGE_LATEST (Image might not exist or registry error)."
+            fi
+
+            # 다이제스트 길이 로깅 (디버깅용)
+            echo "Digest length: ${#LATEST_DIGEST}"
+            # 조회된 다이제스트 (또는 빈 문자열)를 출력으로 설정
+            echo "latest_digest=$LATEST_DIGEST" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # 6. 다이제스트 비교 및 푸시 결정
+      - name: Check digests and set push flag
+        id: check-push-dh
+        run: |
+          # 빌드된 이미지의 매니페스트 다이제스트 (input으로 받음)
+          BUILT_DIGEST="${{ inputs.image_digest_built }}"
+          # Docker Hub에서 조회한 매니페스트 다이제스트
+          LATEST_DIGEST="${{ steps.get-latest-digest-dh.outputs.latest_digest }}"
+
+          echo "=== Digest Comparison ==="
+          echo "Built Digest  : [${BUILT_DIGEST}] (Length: ${#BUILT_DIGEST})"
+          echo "Latest Digest : [${LATEST_DIGEST}] (Length: ${#LATEST_DIGEST})"
+
+          if [ -n "$BUILT_DIGEST" ] && ([ "$BUILT_DIGEST" != "$LATEST_DIGEST" ] || [ -z "$LATEST_DIGEST" ]); then
+            echo "Result: Digests differ or latest is empty. Push required."
+            echo "push_required=true" >> $GITHUB_OUTPUT
+          else
+            echo "Result: Digests match or built digest is empty. Push not required."
+            echo "push_required=false" >> $GITHUB_OUTPUT
+          fi
+          echo "========================="
+
+        shell: bash
+
+      # 7. Multi-arch manifest 복사 (buildx imagetools 사용)
+      - name: Copy multi-arch image to Docker Hub
+        # check-push-dh 스텝에서 push_required가 true일 때만 실행
+        if: steps.check-push-dh.outputs.push_required == 'true'
+        env:
+          DH_USER: ${{ secrets.dockerhub_username }}
+          DH_REPO: ${{ inputs.dockerhub_repo_name }}
+          TAG_SHA: ${{ inputs.image_tag_sha }}
+          TAG_LATEST: ${{ inputs.image_tag_latest }}
+          GHCR_IMAGE_SHA: ${{ inputs.ghcr_image_uri_sha }}
+        run: |
+          # Docker Hub용 전체 이름 구성 (사용자명/리포명 소문자 변환)
+          DH_USER_LC=$(echo "$DH_USER" | tr '[:upper:]' '[:lower:]')
+          DH_REPO_LC=$(echo "$DH_REPO" | tr '[:upper:]' '[:lower:]')
+          DH_IMAGE_BASE="${DH_USER_LC}/${DH_REPO_LC}"
+
+          echo "Copying multi-arch manifest from GHCR to Docker Hub..."
+          
+          # buildx imagetools를 사용하여 multi-arch manifest 복사
+          # SHA 태그 복사
+          echo "Creating $DH_IMAGE_BASE:$TAG_SHA from $GHCR_IMAGE_SHA"
+          docker buildx imagetools create \
+            --tag $DH_IMAGE_BASE:$TAG_SHA \
+            $GHCR_IMAGE_SHA
+          
+          if [ $? -ne 0 ]; then 
+            echo "Error: Failed to copy to $DH_IMAGE_BASE:$TAG_SHA"
+            exit 1
+          fi
+
+          # latest 태그 복사
+          echo "Creating $DH_IMAGE_BASE:$TAG_LATEST from $GHCR_IMAGE_SHA"
+          docker buildx imagetools create \
+            --tag $DH_IMAGE_BASE:$TAG_LATEST \
+            $GHCR_IMAGE_SHA
+          
+          if [ $? -ne 0 ]; then 
+            echo "Warning: Failed to copy to $DH_IMAGE_BASE:$TAG_LATEST"
+          fi
+
+          # 복사된 이미지의 아키텍처 확인
+          echo "Verifying multi-arch support for pushed image:"
+          docker buildx imagetools inspect $DH_IMAGE_BASE:$TAG_LATEST
+
+        shell: bash
+
+      # 8. 푸시 건너뛰기 메시지 (조건부 실행)
+      - name: Image push skipped
+        # check-push-dh 스텝에서 push_required가 false일 때만 실행
+        if: steps.check-push-dh.outputs.push_required == 'false'
+        run: |
+            echo "Docker Hub push skipped: Image content digest matches the existing :latest tag or built digest is missing."
+        shell: bash
