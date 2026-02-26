@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ======================================================================
-# Dockerfile for CherryRecorder Server (Optimized Multi-stage Build with Boost.Beast)
+# Dockerfile for Memory Atlas Server (Optimized Multi-stage Build with Boost.Beast)
 # ======================================================================
 
 # ----------------------------------------------------------------------
@@ -172,14 +172,14 @@ COPY include/ include/
 # ARM64에서는 메모리 제약을 고려하여 병렬성 조정
 ARG TARGETARCH
 RUN if [ "${TARGETARCH}" = "arm64" ]; then \
-        cmake --build build --target CherryRecorder-Server-App -j 2; \
+        cmake --build build --target MemoryAtlas-Server-App -j 2; \
     else \
-        cmake --build build --target CherryRecorder-Server-App -j $(nproc); \
+        cmake --build build --target MemoryAtlas-Server-App -j $(nproc); \
     fi
 
 # --- STEP 5: 빌드된 실행 파일 의존성 확인 ---
 # ldd를 사용하여 실행 파일의 동적 라이브러리 의존성을 확인합니다 (디버깅용).
-RUN ldd /app/build/CherryRecorder-Server-App || echo "ldd check skipped or failed"
+RUN ldd /app/build/MemoryAtlas-Server-App || echo "ldd check skipped or failed"
 
 # ----------------------------------------------------------------------
 # 스테이지 2: "final" - 애플리케이션 실행 전용 환경
@@ -187,7 +187,7 @@ RUN ldd /app/build/CherryRecorder-Server-App || echo "ldd check skipped or faile
 FROM ubuntu:24.04 AS final
 
 LABEL maintainer="Kim Hyeonwoo <ialskdji@gmail.com>" \
-      description="CherryRecorder Server Application - Beast HTTP/S, WebSocket Services" \
+      description="Memory Atlas Server - place search, memory persistence, and realtime services" \
       version="0.3.0"
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -215,7 +215,7 @@ RUN useradd --system --create-home --shell /bin/bash appuser
 WORKDIR /home/appuser/app
 
 # 최종 실행 파일 및 인증서 복사
-COPY --from=builder --chown=appuser:appuser /app/build/CherryRecorder-Server-App ./CherryRecorder-App
+COPY --from=builder --chown=appuser:appuser /app/build/MemoryAtlas-Server-App ./MemoryAtlas-Server-App
 # SSL 인증서는 AWS NLB에서 처리하므로 복사하지 않음
 # COPY --from=builder --chown=appuser:appuser /app/cert.pem ./cert.pem
 # COPY --from=builder --chown=appuser:appuser /app/key.pem ./key.pem
@@ -260,6 +260,6 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
 # docker-compose.yml 또는 docker run 명령어의 --env-file 옵션을 통해 환경 변수 주입
 # AWS 환경에서는 NLB가 SSL termination을 처리하므로 HTTP 포트만 사용
 # 자체 HTTPS가 필요한 경우 cert.pem과 key.pem 파일을 추가하고 아래 CMD 사용
-# CMD ["./CherryRecorder-App", "--cert_path=./cert.pem", "--key_path=./key.pem"]
+# CMD ["./MemoryAtlas-Server-App", "--cert_path=./cert.pem", "--key_path=./key.pem"]
 
-CMD ["./CherryRecorder-App"]
+CMD ["./MemoryAtlas-Server-App"]

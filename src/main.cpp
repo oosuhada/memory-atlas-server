@@ -155,7 +155,7 @@ int main(int argc, char* argv[]) {
 #endif
     // --- 콘솔 설정 끝 ---
 
-    fprintf(stdout, "CherryRecorder Server v1.1 - WEBSOCKET_FIX_APPLIED\n");
+    fprintf(stdout, "Memory Atlas Server v1.1\n");
 
     // --- io_context 생성 --- 
     // 모든 서버가 io_context를 공유하도록 변경 (더 효율적일 수 있음)
