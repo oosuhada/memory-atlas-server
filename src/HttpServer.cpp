@@ -4,7 +4,6 @@
 #include <boost/core/ignore_unused.hpp> // boost::ignore_unused 사용
 
 #include <chrono>
-#include <algorithm>
 #include <exception> // std::terminate, std::exception
 #include <memory>
 #include <thread> // std::thread
@@ -13,92 +12,13 @@
 #include <cstdio> // fprintf 사용
 #include <sstream> // std::stringstream (스레드 ID 로깅용)
 #include <stdexcept>
-#include <mutex>
-#include <boost/json.hpp>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 
 // 필요한 네임스페이스 정의 (HttpServer.hpp 와 동일하게)
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = boost::asio::ip::tcp;
-namespace json = boost::json;
-
-namespace {
-std::mutex memory_mutex;
-std::vector<json::object> memory_moments;
-bool memory_store_loaded = false;
-
-std::filesystem::path memory_store_path() {
-    if (const char* configured = std::getenv("MEMORY_ATLAS_DATA_FILE"); configured != nullptr && *configured != '\0') {
-        return configured;
-    }
-    return std::filesystem::path("data") / "memories.json";
-}
-
-void load_memory_store_locked() {
-    if (memory_store_loaded) {
-        return;
-    }
-    memory_store_loaded = true;
-
-    const auto path = memory_store_path();
-    std::ifstream input(path);
-    if (!input.is_open()) {
-        return;
-    }
-
-    try {
-        std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        if (contents.empty()) {
-            return;
-        }
-        const auto parsed = json::parse(contents);
-        if (!parsed.is_array()) {
-            fprintf(stderr, "Memory store ignored because '%s' is not a JSON array.\n", path.string().c_str());
-            return;
-        }
-        for (const auto& item : parsed.as_array()) {
-            if (item.is_object()) {
-                memory_moments.emplace_back(item.as_object());
-            }
-        }
-        fprintf(stdout, "Loaded %zu Memory Atlas moments from %s.\n", memory_moments.size(), path.string().c_str());
-    }
-    catch (const std::exception& exception) {
-        fprintf(stderr, "Memory store load failed for '%s': %s\n", path.string().c_str(), exception.what());
-    }
-}
-
-void persist_memory_store_locked() {
-    const auto path = memory_store_path();
-    if (path.has_parent_path()) {
-        std::filesystem::create_directories(path.parent_path());
-    }
-
-    json::array payload;
-    payload.reserve(memory_moments.size());
-    for (const auto& memory : memory_moments) {
-        payload.emplace_back(memory);
-    }
-
-    const auto temporary_path = path.string() + ".tmp";
-    {
-        std::ofstream output(temporary_path, std::ios::trunc);
-        if (!output.is_open()) {
-            throw std::runtime_error("Unable to open Memory Atlas persistence file for writing.");
-        }
-        output << json::serialize(payload);
-        output.flush();
-        if (!output.good()) {
-            throw std::runtime_error("Unable to flush Memory Atlas persistence file.");
-        }
-    }
-    std::filesystem::rename(temporary_path, path);
-}
-}
 
 /**
  * @file HttpServer.cpp
@@ -246,15 +166,6 @@ private:
             fprintf(stdout, "[HttpSession %p] Places API 요청 감지: /places/search\n", (void*)this);
             handle_places_search_request(); // 장소 검색 요청 처리
         }
-        else if (req_.method() == http::verb::get && req_.target() == "/memories") {
-            handle_memory_list_request();
-        }
-        else if (req_.method() == http::verb::post && req_.target() == "/memories") {
-            handle_memory_create_request();
-        }
-        else if (req_.method() == http::verb::delete_ && req_.target().starts_with("/memories/")) {
-            handle_memory_delete_request(std::string(req_.target()).substr(std::string("/memories/").size()));
-        }
         else if (req_.method() == http::verb::post && req_.target() == "/places/details") {
             // fprintf(stdout, "[HttpSession %p] Places API 요청 감지: /places/details (POST - Deprecated)\n", (void*)this);
             // handle_place_details_request(); // 기존 방식 제거
@@ -329,155 +240,9 @@ private:
         send_response(std::move(res));
     }
 
-    /**
-     * @brief Memory Atlas에 저장된 순간 목록을 반환한다.
-     *
-     * JSON 파일 기반 영속 저장소를 사용해 프로세스 재시작 뒤에도 기억을 유지한다.
-     * 저장 경로는 MEMORY_ATLAS_DATA_FILE 환경변수로 재정의할 수 있다.
-     */
-    void handle_memory_list_request() {
-        json::array memories;
-        {
-            std::scoped_lock lock(memory_mutex);
-            load_memory_store_locked();
-            for (const auto& memory : memory_moments) {
-                memories.emplace_back(memory);
-            }
-        }
-
-        json::object payload;
-        payload["count"] = static_cast<std::int64_t>(memories.size());
-        payload["items"] = std::move(memories);
-
-        http::response<http::string_body> res{http::status::ok, req_.version()};
-        res.set(http::field::server, "MemoryAtlas");
-        res.set(http::field::content_type, "application/json; charset=utf-8");
-        res.keep_alive(req_.keep_alive());
-        res.body() = json::serialize(payload);
-        res.prepare_payload();
-        send_response(std::move(res));
-    }
-
-    /**
-     * @brief 장소에 연결된 개인 기억을 생성한다.
-     *
-     * 필수 값은 place와 title이며, sense는 향/음악/맛/기분 같은 자유로운 감각 메모다.
-     */
-    void handle_memory_create_request() {
-        try {
-            const auto parsed = json::parse(req_.body());
-            if (!parsed.is_object()) {
-                handle_bad_request("Memory payload must be a JSON object.");
-                return;
-            }
-
-            const auto& input = parsed.as_object();
-            const auto* place_value = input.if_contains("place");
-            const auto* title_value = input.if_contains("title");
-
-            if (place_value == nullptr || !place_value->is_string() || place_value->as_string().empty()) {
-                handle_bad_request("Field 'place' is required.");
-                return;
-            }
-            if (title_value == nullptr || !title_value->is_string() || title_value->as_string().empty()) {
-                handle_bad_request("Field 'title' is required.");
-                return;
-            }
-
-            const auto now = std::chrono::system_clock::now();
-            const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()).count();
-
-            json::object memory;
-            memory["id"] = std::to_string(timestamp);
-            memory["place"] = place_value->as_string();
-            memory["title"] = title_value->as_string();
-            memory["sense"] = input.if_contains("sense") != nullptr && input.at("sense").is_string()
-                ? input.at("sense").as_string()
-                : json::string("");
-            const auto* latitude_value = input.if_contains("latitude");
-            const auto* longitude_value = input.if_contains("longitude");
-            const bool has_latitude = latitude_value != nullptr
-                && (latitude_value->is_double() || latitude_value->is_int64() || latitude_value->is_uint64());
-            const bool has_longitude = longitude_value != nullptr
-                && (longitude_value->is_double() || longitude_value->is_int64() || longitude_value->is_uint64());
-            memory["latitude"] = has_latitude ? *latitude_value : json::value(nullptr);
-            memory["longitude"] = has_longitude ? *longitude_value : json::value(nullptr);
-            memory["createdAtEpochMs"] = timestamp;
-
-            {
-                std::scoped_lock lock(memory_mutex);
-                load_memory_store_locked();
-                memory_moments.insert(memory_moments.begin(), memory);
-                persist_memory_store_locked();
-            }
-
-            http::response<http::string_body> res{http::status::created, req_.version()};
-            res.set(http::field::server, "MemoryAtlas");
-            res.set(http::field::content_type, "application/json; charset=utf-8");
-            res.keep_alive(req_.keep_alive());
-            res.body() = json::serialize(memory);
-            res.prepare_payload();
-            send_response(std::move(res));
-        }
-        catch (const std::exception& exception) {
-            fprintf(stderr, "[HttpSession %p] Invalid memory payload: %s\n", (void*)this, exception.what());
-            handle_bad_request("Invalid JSON payload for memory.");
-        }
-    }
-
-    void handle_memory_delete_request(const std::string& memory_id) {
-        if (memory_id.empty()) {
-            handle_bad_request("Memory id is required.");
-            return;
-        }
-
-        bool removed = false;
-        try {
-            std::scoped_lock lock(memory_mutex);
-            load_memory_store_locked();
-            const auto before = memory_moments.size();
-            memory_moments.erase(
-                std::remove_if(
-                    memory_moments.begin(),
-                    memory_moments.end(),
-                    [&memory_id](const json::object& memory) {
-                        const auto* id = memory.if_contains("id");
-                        return id != nullptr && id->is_string() && id->as_string() == memory_id;
-                    }),
-                memory_moments.end());
-            removed = memory_moments.size() != before;
-            if (removed) {
-                persist_memory_store_locked();
-            }
-        }
-        catch (const std::exception& exception) {
-            fprintf(stderr, "Memory delete persistence failure: %s\n", exception.what());
-            handle_server_error("Unable to persist memory deletion.");
-            return;
-        }
-
-        if (!removed) {
-            http::response<http::string_body> res{http::status::not_found, req_.version()};
-            res.set(http::field::server, "MemoryAtlas");
-            res.set(http::field::content_type, "application/json; charset=utf-8");
-            res.keep_alive(req_.keep_alive());
-            res.body() = "{\"error\":\"Memory not found\"}";
-            res.prepare_payload();
-            send_response(std::move(res));
-            return;
-        }
-
-        http::response<http::string_body> res{http::status::no_content, req_.version()};
-        res.set(http::field::server, "MemoryAtlas");
-        res.keep_alive(req_.keep_alive());
-        res.prepare_payload();
-        send_response(std::move(res));
-    }
-
     void handle_options_request() {
         http::response<http::string_body> res{http::status::no_content, req_.version()};
-        res.set(http::field::server, "MemoryAtlas");
+        res.set(http::field::server, "WebServer");
         res.keep_alive(req_.keep_alive());
         res.prepare_payload();
         send_response(std::move(res));
@@ -573,18 +338,6 @@ private:
         res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
         res.set(http::field::content_type, "text/plain");
         res.body() = std::string(why);
-        res.prepare_payload();
-        send_response(std::move(res));
-    }
-
-    void handle_server_error(beast::string_view why) {
-        http::response<http::string_body> res{http::status::internal_server_error, req_.version()};
-        res.set(http::field::server, "MemoryAtlas");
-        res.set(http::field::content_type, "application/json; charset=utf-8");
-        res.keep_alive(req_.keep_alive());
-        json::object payload;
-        payload["error"] = std::string(why);
-        res.body() = json::serialize(payload);
         res.prepare_payload();
         send_response(std::move(res));
     }

@@ -1,7 +1,7 @@
 {
-  "name": "memory-atlas-server",
+  "name": "cherryrecorder-server",
   "version": "0.1.0",
-  "description": "C++ backend for Memory Atlas place search, realtime services, and persistent memory moments",
+  "description": "Server component for the CherryRecorder application",
   "homepage": "https://github.com/oosuhada/memory-atlas-server",
   "dependencies": [
     "boost-asio",

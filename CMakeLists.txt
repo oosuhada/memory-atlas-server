@@ -1,5 +1,5 @@
 # ======================================================================
-# CMakeLists.txt for Memory Atlas Server
+# CMakeLists.txt for CherryRecorder-Server
 # ======================================================================
 
 # ----------------------------------------------------------------------
@@ -32,7 +32,7 @@ endif()
 # 프로젝트 및 C++ 표준 설정
 # ----------------------------------------------------------------------
 # 프로젝트 이름과 사용 언어(C++)를 정의합니다.
-project("MemoryAtlas-Server" LANGUAGES CXX)
+project("CherryRecorder-Server" LANGUAGES CXX)
 
 # 전역적으로 사용할 C++ 표준 및 설정을 지정합니다.
 set(CMAKE_CXX_STANDARD 20)          # C++20 표준 사용
@@ -71,7 +71,7 @@ if(WIN32)
 endif()
 
 # ----------------------------------------------------------------------
-# 라이브러리 타겟 정의 (Memory Atlas Server)
+# 라이브러리 타겟 정의 (CherryRecorder-Server)
 # ----------------------------------------------------------------------
 # 애플리케이션 핵심 로직을 포함하는 정적 라이브러리(기본값)를 정의합니다.
 # --- Boost 라이브러리 찾기 (Asio + Beast) ---
@@ -182,24 +182,27 @@ message(STATUS "Configured target: ChatServerLib library (WebSocket Chat)")
 # ----------------------------------------------------------------------
 
 # Beast 기반 실행 파일 (모든 플랫폼)
-add_executable(MemoryAtlas-Server-App)
-target_sources(MemoryAtlas-Server-App
+add_executable(CherryRecorder-Server-App)
+target_sources(CherryRecorder-Server-App
     PRIVATE
         src/main.cpp
 )
-target_include_directories(MemoryAtlas-Server-App
+target_include_directories(CherryRecorder-Server-App
     PRIVATE
         ${Boost_INCLUDE_DIRS}
 )
-target_link_libraries(MemoryAtlas-Server-App
+target_link_libraries(CherryRecorder-Server-App
     PRIVATE
         ChatServerLib
         HttpServerLib
 )
 if(NOT WIN32)
-    target_link_libraries(MemoryAtlas-Server-App PRIVATE Threads::Threads)
+    target_link_libraries(CherryRecorder-Server-App PRIVATE Threads::Threads)
 endif()
-message(STATUS "Configured target: MemoryAtlas-Server-App executable (Beast-based)")
+message(STATUS "Configured target: CherryRecorder-Server-App executable (Beast-based)")
+
+add_executable(CherryRecorder-App ALIAS CherryRecorder-Server-App)
+message(STATUS "Created alias: CherryRecorder-App -> CherryRecorder-Server-App")
 
 # ----------------------------------------------------------------------
 # 테스트 설정 (gtest)
@@ -221,14 +224,14 @@ if(BUILD_TESTING)
     include(GoogleTest)
 
     # 테스트 실행 파일 정의
-    add_executable(MemoryAtlas-Tests
+    add_executable(CherryRecorder-Tests
         tests/test_main.cpp
         tests/test_chat_server.cpp
         tests/test_http_server.cpp
     )
 
     # 테스트 실행 파일에 필요한 라이브러리 링크
-    target_link_libraries(MemoryAtlas-Tests PRIVATE
+    target_link_libraries(CherryRecorder-Tests PRIVATE
         ChatServerLib
         HttpServerLib
         OpenSSL::SSL
@@ -239,9 +242,9 @@ if(BUILD_TESTING)
     )
     
     # gtest_discover_tests를 사용하여 CTest에 테스트를 추가합니다.
-    gtest_discover_tests(MemoryAtlas-Tests)
+    gtest_discover_tests(CherryRecorder-Tests)
     
-    message(STATUS "Configured target: MemoryAtlas-Tests executable")
+    message(STATUS "Configured target: CherryRecorder-Tests executable")
 
 else()
     message(STATUS "BUILD_TESTING is OFF. Skipping test configuration.")
@@ -252,7 +255,7 @@ endif()
 # ----------------------------------------------------------------------
 # 설치(install) 명령어를 사용할 경우, 실행 파일과 라이브러리를
 # 지정된 디렉토리에 복사하도록 설정할 수 있습니다.
-# 예: install(TARGETS MemoryAtlas-Server-App DESTINATION bin)
+# 예: install(TARGETS CherryRecorder-Server-App DESTINATION bin)
 # 현재 프로젝트에서는 로컬 빌드 및 실행이 주 목적이므로 생략합니다.
 
 # ----------------------------------------------------------------------
