@@ -1,0 +1,10 @@
+{
+  "experiment": "memory-atlas-places-retry-policy-v1",
+  "http_scenarios": 5,
+  "network_scenarios": 3,
+  "passed": 8,
+  "total": 8,
+  "max_attempts": 3,
+  "backoff_ms": [100, 200, 400],
+  "limitations": ["Policy probe injects failure classes without calling Google Places; it verifies retry boundaries, not upstream availability."]
+}

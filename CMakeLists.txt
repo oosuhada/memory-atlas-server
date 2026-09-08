@@ -229,6 +229,7 @@ if(BUILD_TESTING)
         tests/test_chat_server.cpp
         tests/test_http_server.cpp
         tests/test_message_history.cpp
+        tests/test_places_retry_policy.cpp
     )
 
     # 테스트 실행 파일에 필요한 라이브러리 링크

@@ -1,4 +1,5 @@
 #include "../include/handlers/PlacesApiHandler.hpp"
+#include "../include/PlacesRetryPolicy.hpp"
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
@@ -19,6 +20,23 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
 namespace json = boost::json;
+
+namespace {
+PlacesNetworkFailure classify_places_network_failure(const boost::system::error_code& ec) {
+    if (ec == net::error::address_not_available) return PlacesNetworkFailure::address_not_available;
+    if (ec == net::error::connection_aborted) return PlacesNetworkFailure::connection_aborted;
+    if (ec == net::error::connection_refused) return PlacesNetworkFailure::connection_refused;
+    if (ec == net::error::connection_reset) return PlacesNetworkFailure::connection_reset;
+    if (ec == net::error::host_unreachable) return PlacesNetworkFailure::host_unreachable;
+    if (ec == net::error::network_down) return PlacesNetworkFailure::network_down;
+    if (ec == net::error::network_reset) return PlacesNetworkFailure::network_reset;
+    if (ec == net::error::network_unreachable) return PlacesNetworkFailure::network_unreachable;
+    if (ec == net::error::timed_out) return PlacesNetworkFailure::timed_out;
+    if (ec == net::error::try_again) return PlacesNetworkFailure::try_again;
+    if (ec == net::error::operation_aborted) return PlacesNetworkFailure::operation_aborted;
+    return PlacesNetworkFailure::other;
+}
+}
 namespace ssl = boost::asio::ssl;
 using tcp = boost::asio::ip::tcp;
 
@@ -267,67 +285,13 @@ json::value PlacesApiHandler::requestGooglePlacesApi(
         // }
         // std::cout << "API 키 길이: " << m_apiKey.length() << std::endl;
         
-        // SSL 컨텍스트 및 IO 컨텍스트 설정
-        net::io_context ioc;
+        // SSL 컨텍스트 설정. 각 retry attempt는 새 socket/io_context를 사용한다.
         ssl::context ctx(ssl::context::tlsv12_client);
         ctx.set_default_verify_paths();
-        
-        // HTTPS 연결 설정
-        tcp::resolver resolver(ioc);
-        ssl::stream<tcp::socket> stream(ioc, ctx);
-        
-        // 호스트 이름 추출
+
         std::string host = "places.googleapis.com";
-        auto const results = resolver.resolve(host, "443");
-        
-        // 연결 설정 (재시도 로직 포함)
-        int retry_count = 0;
-        const int max_retries = 3;
-        boost::system::error_code last_error;
-        
-        while (retry_count < max_retries) {
-            try {
-                boost::system::error_code ec;
-                net::connect(stream.next_layer(), results.begin(), results.end(), ec);
-                
-                if (!ec) {
-                    // 연결 성공
-                    break;
-                }
-                
-                last_error = ec;
-                std::cerr << "[PlacesApiHandler] Connect attempt " << (retry_count + 1) 
-                          << " failed to " << host << ": " 
-                          << ec.message() << " [" << ec.value() << "]" << std::endl;
-                
-                // EADDRNOTAVAIL (99) 에러인 경우 재시도
-                if (ec.value() == 99 && retry_count < max_retries - 1) {
-                    // 잠시 대기 (지수 백오프)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100 * (retry_count + 1)));
-                    
-                    // 새로운 IO context와 소켓으로 재시도
-                    ioc.restart();
-                    ssl::stream<tcp::socket> new_stream(ioc, ctx);
-                    stream = std::move(new_stream);
-                    retry_count++;
-                } else {
-                    throw boost::system::system_error(ec);
-                }
-            } catch (const std::exception& e) {
-                if (retry_count >= max_retries - 1) {
-                    std::cerr << "[PlacesApiHandler] All connection attempts failed: " << e.what() << std::endl;
-                    throw;
-                }
-                retry_count++;
-            }
-        }
-        
-        if (retry_count >= max_retries && last_error) {
-            throw boost::system::system_error(last_error);
-        }
-        stream.handshake(ssl::stream_base::client);
-        
-        // HTTP 요청 준비 (메서드 파라미터 사용)
+
+        // HTTP 요청 준비 (모든 attempt에서 동일 payload를 재사용)
         http::request<http::string_body> req{method, endpoint, 11};
         req.set(http::field::host, host);
         req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
@@ -347,49 +311,61 @@ json::value PlacesApiHandler::requestGooglePlacesApi(
             req.body() = json::serialize(requestData);
         }
         req.prepare_payload();
-        
-        // 요청 전송
-        http::write(stream, req);
-        
-        // 응답 수신
-        beast::flat_buffer buffer;
+
         http::response<http::string_body> res;
-        beast::error_code ec;
-        http::read(stream, buffer, res);
-        
-        // http::read 이후 오류 코드 로깅 추가
-        if (ec && ec != http::error::end_of_stream) {
-            std::cerr << "[PlacesApiHandler::requestGooglePlacesApi] Error after http::read: " 
-                      << ec.message() << " (Code: " << ec.value() << ")" << std::endl;
-            // 기존 예외 처리는 유지 (필요시)
-            // throw beast::system_error{ec, "Read failed"};
+        bool completed = false;
+
+        for (int attempt = 0; attempt < PlacesRetryPolicy::max_attempts; ++attempt) {
+            try {
+                net::io_context ioc;
+                tcp::resolver resolver(ioc);
+                ssl::stream<tcp::socket> stream(ioc, ctx);
+                auto const results = resolver.resolve(host, "443");
+                net::connect(stream.next_layer(), results.begin(), results.end());
+                stream.handshake(ssl::stream_base::client);
+                http::write(stream, req);
+
+                beast::flat_buffer buffer;
+                beast::error_code read_ec;
+                http::read(stream, buffer, res, read_ec);
+                if (read_ec && read_ec != http::error::end_of_stream) {
+                    throw beast::system_error{read_ec, "Google Places read failed"};
+                }
+
+                beast::error_code shutdown_ec;
+                stream.shutdown(shutdown_ec);
+                if (shutdown_ec == net::error::eof || shutdown_ec == ssl::error::stream_truncated) {
+                    shutdown_ec = {};
+                }
+                if (shutdown_ec) {
+                    throw beast::system_error{shutdown_ec, "Google Places TLS shutdown failed"};
+                }
+
+                if (PlacesRetryPolicy::is_retryable_http_status(res.result_int()) &&
+                    attempt + 1 < PlacesRetryPolicy::max_attempts) {
+                    std::cerr << "[PlacesApiHandler] transient upstream HTTP " << res.result_int()
+                              << ", retry " << (attempt + 1) << "/" << (PlacesRetryPolicy::max_attempts - 1)
+                              << std::endl;
+                    std::this_thread::sleep_for(PlacesRetryPolicy::backoff_for_attempt(attempt));
+                    continue;
+                }
+
+                completed = true;
+                break;
+            } catch (const boost::system::system_error& e) {
+                const bool retryable = PlacesRetryPolicy::is_retryable_network_failure(classify_places_network_failure(e.code()));
+                if (!retryable || attempt + 1 >= PlacesRetryPolicy::max_attempts) {
+                    throw;
+                }
+                std::cerr << "[PlacesApiHandler] transient network failure: " << e.code().message()
+                          << ", retry " << (attempt + 1) << "/" << (PlacesRetryPolicy::max_attempts - 1)
+                          << std::endl;
+                std::this_thread::sleep_for(PlacesRetryPolicy::backoff_for_attempt(attempt));
+            }
         }
-        // 정상적인 EOF는 로그하지 않음 (I/O 부하 감소)
-        // else if (ec == http::error::end_of_stream) {
-        //      std::cerr << "[PlacesApiHandler::requestGooglePlacesApi] Normal EOF after http::read." << std::endl;
-        // } else {
-        //      std::cerr << "[PlacesApiHandler::requestGooglePlacesApi] No error after http::read." << std::endl;
-        // }
 
-        // 연결 종료
-        // beast::error_code ec; // ec 변수는 이미 선언됨
-        stream.shutdown(ec);
-
-        // stream.shutdown 이후 오류 코드 로깅 추가
-        if(ec == net::error::eof) {
-            // 정상적인 EOF는 로그하지 않음 (I/O 부하 감소)
-            // std::cerr << "[PlacesApiHandler::requestGooglePlacesApi] Normal EOF during shutdown." << std::endl;
-            ec = {}; ///< Clear the error code for EOF
-        } else if (ec == ssl::error::stream_truncated) {
-            // 정상적인 stream_truncated도 로그하지 않음 (I/O 부하 감소)
-            // std::cerr << "[PlacesApiHandler::requestGooglePlacesApi] Stream truncated during shutdown (Code: " 
-            //           << ec.value() << "). Ignored." << std::endl;
-            ec = {}; ///< stream_truncated 오류는 일단 무시하고 로깅만
-        } else if (ec) {
-             std::cerr << "[PlacesApiHandler::requestGooglePlacesApi] Error during stream shutdown: " 
-                      << ec.message() << " (Code: " << ec.value() << ")" << std::endl;
-            // 기존 예외 처리 유지
-            throw beast::system_error{ec};
+        if (!completed) {
+            throw std::runtime_error("Google Places request exhausted retry budget");
         }
         
         // 응답 본문 파싱 및 변환
@@ -419,6 +395,8 @@ json::value PlacesApiHandler::requestGooglePlacesApi(
              json::object error_obj;
              error_obj["__error_status_code"] = res.result_int(); ///< 원본 상태 코드 저장
              error_obj["__error_body"] = json::serialize(response_json); ///< 파싱된 JSON 오류 메시지 저장
+             error_obj["__failure_category"] = res.result_int() == 429 ? "rate_limited" :
+                                                   (res.result_int() >= 500 ? "upstream_5xx" : "upstream_4xx");
              return error_obj;
         }
         // ===== 오류 처리 끝 =====

@@ -49,3 +49,11 @@ export GOOGLE_MAPS_API_KEY="..."
 ```
 
 장소 검색 기능에는 Google Maps API key가 필요합니다. `.env.example`을 참고해 로컬 환경변수로 설정하세요.
+
+## Reliability evidence
+
+Google Places calls now use a bounded retry policy across the whole request rather than special-casing one connect error. Transient network failures plus HTTP **408 / 429 / 5xx** are retried with at most **3 total attempts** and **100 / 200 / 400 ms** exponential backoff. Terminal client errors and cancellation are not retried. HTTP body reads now use the explicit error-code overload so read failures are surfaced instead of checking an unrelated default `error_code` after a throwing read call.
+
+`tools/places_retry_policy_probe.cpp` is a dependency-free failure-injection probe built from the same policy used by `PlacesApiHandler`. The current fixture passes **8/8** HTTP/network classification scenarios. GTest coverage is also wired into the normal `BUILD_TESTING` target, and `.github/workflows/reliability-evidence.yml` compiles and runs the probe independently.
+
+This does **not** claim Google Places availability or end-to-end request latency. The probe verifies retry boundaries without making a live upstream call; DNS, TLS, provider outages, and real network timing still require integration/production observation.
