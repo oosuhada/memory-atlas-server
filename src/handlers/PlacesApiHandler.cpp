@@ -8,6 +8,7 @@
 #include <boost/asio/ssl/error.hpp>
 #include <boost/asio/ssl/stream.hpp>
 #include <boost/json.hpp>
+#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -23,7 +24,7 @@ namespace json = boost::json;
 
 namespace {
 PlacesNetworkFailure classify_places_network_failure(const boost::system::error_code& ec) {
-    if (ec == net::error::address_not_available) return PlacesNetworkFailure::address_not_available;
+    if (ec.value() == EADDRNOTAVAIL) return PlacesNetworkFailure::address_not_available;
     if (ec == net::error::connection_aborted) return PlacesNetworkFailure::connection_aborted;
     if (ec == net::error::connection_refused) return PlacesNetworkFailure::connection_refused;
     if (ec == net::error::connection_reset) return PlacesNetworkFailure::connection_reset;
