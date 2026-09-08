@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -55,6 +57,42 @@ TEST_F(MessageHistoryTest, LimitLargerThanFileReturnsEveryEntry) {
 
     const auto all = history.load_global_history(100);
     EXPECT_EQ(all.size(), 3U);
+}
+
+TEST_F(MessageHistoryTest, RoomNamesCannotEscapeRoomsDirectory) {
+    MessageHistory history(history_dir_.string());
+    history.log_room_message("../global/escaped", "escape-attempt", "tester");
+
+    EXPECT_FALSE(std::filesystem::exists(history_dir_ / "global" / "escaped.txt"));
+    EXPECT_TRUE(std::filesystem::exists(history_dir_ / "rooms" / "___global_escaped.txt"));
+    const auto loaded = history.load_room_history("../global/escaped", 10);
+    ASSERT_EQ(loaded.size(), 1U);
+    EXPECT_NE(loaded[0].find("escape-attempt"), std::string::npos);
+}
+
+TEST_F(MessageHistoryTest, PrivateHistorySanitizesUserIdentifiersConsistently) {
+    MessageHistory history(history_dir_.string());
+    history.log_private_message("private-message", "../alice", "bob/../../global");
+
+    const auto loaded = history.load_private_history("../alice", "bob/../../global", 10);
+    ASSERT_EQ(loaded.size(), 1U);
+    EXPECT_NE(loaded[0].find("private-message"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(history_dir_ / "global.txt"));
+}
+
+TEST_F(MessageHistoryTest, DurableHistoryWriteModePreservesReadSemantics) {
+#ifndef _WIN32
+    setenv("CHERRY_HISTORY_DURABLE_WRITES", "1", 1);
+#endif
+    MessageHistory history(history_dir_.string());
+    history.log_global_message("durable-mode-message", "tester");
+
+    const auto loaded = history.load_global_history(1);
+    ASSERT_EQ(loaded.size(), 1U);
+    EXPECT_NE(loaded[0].find("durable-mode-message"), std::string::npos);
+#ifndef _WIN32
+    unsetenv("CHERRY_HISTORY_DURABLE_WRITES");
+#endif
 }
 
 } // namespace
