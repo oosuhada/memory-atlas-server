@@ -49,6 +49,13 @@ jobs:
                 vcpkg-${{ runner.os }}-
       - name: Update and Bootstrap vcpkg (Linux)
         run: |
+          if [ ! -x ./vcpkg/bootstrap-vcpkg.sh ]; then
+            rm -rf ./vcpkg
+            git init ./vcpkg
+            git -C ./vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+            git -C ./vcpkg fetch --depth 1 origin b02e341c927f16d991edbd915d8ea43eac52096c
+            git -C ./vcpkg checkout --detach FETCH_HEAD
+          fi
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       # 4. CMake 캐시
