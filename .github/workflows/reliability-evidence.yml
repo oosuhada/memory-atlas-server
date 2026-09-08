@@ -1,0 +1,16 @@
+name: Reliability evidence
+
+on:
+  pull_request:
+  push:
+    branches: [main, "feat/**"]
+
+jobs:
+  retry-policy-probe:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile retry policy probe
+        run: clang++ -std=c++17 -Iinclude tools/places_retry_policy_probe.cpp -o /tmp/places-retry-probe
+      - name: Run deterministic failure-policy probe
+        run: /tmp/places-retry-probe
