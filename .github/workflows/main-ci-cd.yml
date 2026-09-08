@@ -10,6 +10,8 @@ name: CI/CD - CherryRecorder Server
 # GOOGLE_MAPS_API_KEY: Google Maps API 키
 #
 # --- Variables (설정값) ---
+# ENABLE_PAGES_DEPLOY: 'true'일 때만 GitHub Pages 배포 실행
+# ENABLE_CONTAINER_DEPLOY: 'true'일 때만 GHCR/Docker Hub/connection-check 배포 실행
 # DOCKERHUB_REPO: Docker Hub 리포지토리 이름 (사용자명 제외)
 # SERVER_ADDRESS: 서버 주소 (예: cherryrecorder.example.com)
 # HTTP_PORT_VALUE: HTTP 포트 (기본: 8080)
@@ -43,6 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: call_docs_build
     if: |
+        vars.ENABLE_PAGES_DEPLOY == 'true' &&
         needs.call_docs_build.result == 'success' &&
         needs.call_docs_build.outputs.docs-generated == 'true'
     permissions: { pages: write, id-token: write }
@@ -57,6 +60,7 @@ jobs:
   # --- 4. Docker 이미지 빌드 및 GHCR 푸시 ---
   call_docker_build:
     name: 4. Build Docker Image & Push GHCR
+    if: vars.ENABLE_CONTAINER_DEPLOY == 'true'
     uses: ./.github/workflows/reusable-docker-build.yml
     needs: call_build_test
     permissions:
@@ -72,7 +76,10 @@ jobs:
   # --- 5. Docker Hub 푸시 ---
   call_push_dh:
     name: 5. Push Image to Docker Hub (If Changed)
-    if: needs.call_docker_build.result == 'success'
+    if: |
+      vars.ENABLE_CONTAINER_DEPLOY == 'true' &&
+      vars.DOCKERHUB_REPO != '' &&
+      needs.call_docker_build.result == 'success'
     uses: ./.github/workflows/reusable-docker-push-dh.yml
     needs: call_docker_build
     with:
@@ -89,6 +96,8 @@ jobs:
   call_connection_check:
     name: 6. Connection Check (Wait for Watchtower)
     if: |
+      vars.ENABLE_CONTAINER_DEPLOY == 'true' &&
+      vars.SERVER_ADDRESS != '' &&
       needs.call_push_dh.result == 'success' &&
       needs.call_push_dh.outputs.pushed == 'true' &&
       github.event_name == 'push' &&

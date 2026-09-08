@@ -7,6 +7,7 @@
 #include <sstream>
 #include <filesystem>
 #include <chrono>
+#include <deque>
 #include <mutex>
 #include <iomanip>
 
@@ -212,23 +213,31 @@ namespace {
     // 파일의 마지막 N줄 읽기
     std::vector<std::string> read_last_lines(const std::string& filename, size_t limit)
     {
-        std::vector<std::string> lines;
         std::ifstream file(filename);
         
-        if (!file.is_open()) return lines;
-        
-        // 파일의 모든 줄을 읽어옴
-        std::string line;
-        while (std::getline(file, line)) {
-            lines.push_back(line);
-        }
-        
-        // limit가 0이거나 라인 수보다 크면 모든 줄 반환
-        if (limit == 0 || limit >= lines.size()) {
+        if (!file.is_open()) return {};
+
+        // limit == 0 preserves the existing "return all" behavior.
+        if (limit == 0) {
+            std::vector<std::string> lines;
+            std::string line;
+            while (std::getline(file, line)) {
+                lines.push_back(line);
+            }
             return lines;
         }
-        
-        // 마지막 limit 줄만 반환
-        return std::vector<std::string>(lines.end() - limit, lines.end());
+
+        // Tail reads only need the final N records. Keeping a bounded deque avoids
+        // retaining the entire history file in memory for the common limited case.
+        std::deque<std::string> tail;
+        std::string line;
+        while (std::getline(file, line)) {
+            tail.push_back(line);
+            if (tail.size() > limit) {
+                tail.pop_front();
+            }
+        }
+
+        return std::vector<std::string>(tail.begin(), tail.end());
     }
 }
