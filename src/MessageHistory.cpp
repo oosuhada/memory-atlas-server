@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <chrono>
 #include <deque>
+#include <cctype>
 #include <mutex>
 #include <iomanip>
 
@@ -20,6 +21,7 @@ static std::mutex history_mutex;
 namespace {
     std::string get_timestamp();
     std::vector<std::string> read_last_lines(const std::string& filename, size_t limit);
+    std::string safe_path_component(const std::string& value);
 }
 
 //------------------------------------------------------------------------------
@@ -83,8 +85,8 @@ void MessageHistory::log_private_message(const std::string &message, const std::
         std::string log_entry = timestamp + " [" + sender + " -> " + receiver + "]: " + message;
         
         // 두 사용자 ID를 알파벳 순으로 정렬하여 일관된 파일명 생성
-        std::string user1 = sender;
-        std::string user2 = receiver;
+        std::string user1 = safe_path_component(sender);
+        std::string user2 = safe_path_component(receiver);
         if (user1 > user2) std::swap(user1, user2);
         
         std::string filename = history_dir_ + "/private/" + user1 + "_" + user2 + ".txt";
@@ -110,7 +112,7 @@ void MessageHistory::log_room_message(const std::string &room_name, const std::s
         std::string timestamp = get_timestamp();
         std::string log_entry = timestamp + " [" + (sender.empty() ? "system" : sender) + "]: " + message;
         
-        std::string filename = history_dir_ + "/rooms/" + room_name + ".txt";
+        std::string filename = history_dir_ + "/rooms/" + safe_path_component(room_name) + ".txt";
         
         std::lock_guard<std::mutex> lock(history_mutex);
         std::ofstream file(filename, std::ios::app);
@@ -151,8 +153,8 @@ std::vector<std::string> MessageHistory::load_private_history(const std::string 
     
     try {
         // 두 사용자 ID를 알파벳 순으로 정렬하여 일관된 파일명 생성
-        std::string u1 = user1;
-        std::string u2 = user2;
+        std::string u1 = safe_path_component(user1);
+        std::string u2 = safe_path_component(user2);
         if (u1 > u2) std::swap(u1, u2);
         
         std::string filename = history_dir_ + "/private/" + u1 + "_" + u2 + ".txt";
@@ -175,7 +177,7 @@ std::vector<std::string> MessageHistory::load_room_history(const std::string &ro
     if (!enabled_) return result;
     
     try {
-        std::string filename = history_dir_ + "/rooms/" + room_name + ".txt";
+        std::string filename = history_dir_ + "/rooms/" + safe_path_component(room_name) + ".txt";
         
         if (!fs::exists(filename)) return result;
         
@@ -208,6 +210,20 @@ namespace {
         
         ss << std::put_time(&timeinfo, "%Y-%m-%d %H:%M:%S");
         return ss.str();
+    }
+
+    std::string safe_path_component(const std::string& value)
+    {
+        std::string result;
+        result.reserve(value.size());
+        for (unsigned char ch : value) {
+            if (std::isalnum(ch) || ch == '-' || ch == '_') {
+                result.push_back(static_cast<char>(ch));
+            } else {
+                result.push_back('_');
+            }
+        }
+        return result.empty() ? "unknown" : result;
     }
 
     // 파일의 마지막 N줄 읽기
